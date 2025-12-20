@@ -1562,6 +1562,55 @@ HTML_TEMPLATE = """
         updateTimeDisplay();
         setInterval(updateTimeDisplay, 5000);
         
+        // Load current WiFi config from OpenWrt on page load
+        async function loadCurrentWifiConfig() {
+            try {
+                const response = await fetch('/api/get_wifi_config');
+                const data = await response.json();
+                
+                if (data.success && data.config) {
+                    console.log('[CONFIG] Loaded current WiFi config:', data.config);
+                    
+                    for (const [band, cfg] of Object.entries(data.config)) {
+                        const bandLower = band.toLowerCase();
+                        const channelSelect = document.getElementById('channel-' + bandLower);
+                        const bandwidthSelect = document.getElementById('bandwidth-' + bandLower);
+                        
+                        if (channelSelect && cfg.channel) {
+                            // Set channel dropdown
+                            const channelValue = String(cfg.channel);
+                            for (let option of channelSelect.options) {
+                                if (option.value === channelValue) {
+                                    channelSelect.value = channelValue;
+                                    console.log(`[CONFIG] ${band} channel set to: ${channelValue}`);
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        if (bandwidthSelect && cfg.bandwidth) {
+                            // Set bandwidth dropdown
+                            const bwValue = cfg.bandwidth;
+                            for (let option of bandwidthSelect.options) {
+                                if (option.value === bwValue) {
+                                    bandwidthSelect.value = bwValue;
+                                    console.log(`[CONFIG] ${band} bandwidth set to: ${bwValue}`);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    showNotification('Loaded current WiFi configuration from OpenWrt', 'success');
+                }
+            } catch (e) {
+                console.error('[CONFIG] Failed to load WiFi config:', e);
+            }
+        }
+        
+        // Load config on page load (after connection is verified)
+        setTimeout(loadCurrentWifiConfig, 1000);
+        
         // Diagnose connection
         async function diagnoseConnection() {
             setLoading(true);

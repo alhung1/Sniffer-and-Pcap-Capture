@@ -356,6 +356,12 @@ If you encounter issues, please collect:
 
 ## 🔄 Changelog
 
+### v1.4 (2024-12-19)
+- **Added**: Auto-detect current WiFi channel configuration on page load
+  - Channel Configuration dropdowns now show actual OpenWrt settings
+  - No more guessing what channel/bandwidth is currently configured
+- **Added**: Notification when config is loaded from OpenWrt
+
 ### v1.3 (2024-12-19)
 - **Added**: Automatic time synchronization before capture starts
   - PC time is synced to OpenWrt before each capture session
