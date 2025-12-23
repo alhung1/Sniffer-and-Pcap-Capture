@@ -190,3 +190,4 @@ pip install pystray pillow
 - 完整的錯誤訊息
 
 
+

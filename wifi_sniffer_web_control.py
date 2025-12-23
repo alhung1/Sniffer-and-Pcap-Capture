@@ -46,6 +46,13 @@ capture_status = {
 capture_threads = {}
 ssh_connections = {}
 
+# ============== File Split Configuration ==============
+# Split capture files by size to prevent oversized files during long captures
+file_split_config = {
+    "enabled": False,           # Enable/disable file splitting
+    "size_mb": 200,             # Split file size in MB (default 200MB)
+}
+
 # ============== Channel Configuration ==============
 # Default channels for each band
 channel_config = {
@@ -333,14 +340,24 @@ def start_capture_thread(band, auto_sync_time=True):
         # Remote file path
         remote_path = f"/tmp/{band}.pcap"
         
+        # Build tcpdump command based on file split settings
+        # -C option: rotate file after reaching specified size (in millions of bytes)
+        if file_split_config["enabled"]:
+            size_mb = file_split_config["size_mb"]
+            tcpdump_cmd = f"tcpdump -i {interface} -U -s0 -w {remote_path} -C {size_mb}"
+            print(f"[CAPTURE] File splitting enabled: {size_mb}MB per file")
+        else:
+            tcpdump_cmd = f"tcpdump -i {interface} -U -s0 -w {remote_path}"
+            print(f"[CAPTURE] Continuous capture (no file splitting)")
+        
         # Combined command: kill existing tcpdump for THIS interface only, remove old file, start tcpdump
         # Using subshell to properly daemonize tcpdump on BusyBox/OpenWrt
         # NOTE: We only kill tcpdump for this specific interface, not all tcpdump processes
         cmd = f"""
             PID=$(ps | grep "tcpdump -i {interface}" | grep -v grep | awk '{{print $1}}')
             [ -n "$PID" ] && kill $PID 2>/dev/null
-            rm -f {remote_path}
-            (tcpdump -i {interface} -U -s0 -w {remote_path} &)
+            rm -f {remote_path} {remote_path}[0-9]* 
+            ({tcpdump_cmd} &)
             sleep 1
             ps | grep "tcpdump -i {interface}" | grep -v grep && echo 'TCPDUMP_STARTED' || echo 'TCPDUMP_FAILED'
         """
@@ -390,7 +407,7 @@ def monitor_capture(band):
 
 
 def stop_capture(band):
-    """Stop packet capture and download file"""
+    """Stop packet capture and download file(s)"""
     global capture_status
     
     if not capture_status[band]["running"]:
@@ -405,34 +422,69 @@ def stop_capture(band):
         
         # Generate filename with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        local_filename = f"{band}_sniffer_{timestamp}.pcap"
-        local_path = os.path.join(DOWNLOADS_FOLDER, local_filename)
         remote_path = f"/tmp/{band}.pcap"
         
-        # Check if remote file exists
-        success, stdout, stderr = run_ssh_command(f"ls -la {remote_path}", timeout=5)
-        if not success:
+        # Check if file splitting was enabled - list all matching files
+        success, stdout, stderr = run_ssh_command(f"ls -1 {remote_path}* 2>/dev/null", timeout=5)
+        
+        if not success or not stdout.strip():
             capture_status[band]["running"] = False
             capture_status[band]["start_time"] = None
             return False, "No capture file found on router", None
         
-        # Download file via SCP
-        if download_file_scp(remote_path, local_path):
-            # Remove remote file
-            run_ssh_command(f"rm -f {remote_path}", timeout=5)
+        # Parse the list of files
+        remote_files = [f.strip() for f in stdout.strip().split('\n') if f.strip()]
+        print(f"[CAPTURE] Found {len(remote_files)} capture file(s) for {band}")
+        
+        downloaded_files = []
+        total_size = 0
+        
+        if len(remote_files) == 1:
+            # Single file - download with standard naming
+            local_filename = f"{band}_sniffer_{timestamp}.pcap"
+            local_path = os.path.join(DOWNLOADS_FOLDER, local_filename)
             
-            capture_status[band]["running"] = False
-            capture_status[band]["start_time"] = None
-            
-            if os.path.exists(local_path):
-                file_size = os.path.getsize(local_path)
-                return True, f"Saved: {local_filename} ({file_size} bytes)", local_path
-            else:
-                return False, "Download failed", None
+            if download_file_scp(remote_files[0], local_path):
+                if os.path.exists(local_path):
+                    file_size = os.path.getsize(local_path)
+                    total_size = file_size
+                    downloaded_files.append(local_filename)
         else:
-            capture_status[band]["running"] = False
-            capture_status[band]["start_time"] = None
-            return False, "SCP download failed", None
+            # Multiple files (split mode) - download each with numbered naming
+            for i, remote_file in enumerate(remote_files):
+                # Create filename: 2G_sniffer_20231222_143000_part001.pcap
+                part_num = i + 1
+                local_filename = f"{band}_sniffer_{timestamp}_part{part_num:03d}.pcap"
+                local_path = os.path.join(DOWNLOADS_FOLDER, local_filename)
+                
+                print(f"[CAPTURE] Downloading part {part_num}/{len(remote_files)}: {remote_file}")
+                
+                if download_file_scp(remote_file, local_path):
+                    if os.path.exists(local_path):
+                        file_size = os.path.getsize(local_path)
+                        total_size += file_size
+                        downloaded_files.append(local_filename)
+        
+        # Remove all remote files
+        run_ssh_command(f"rm -f {remote_path}*", timeout=5)
+        
+        capture_status[band]["running"] = False
+        capture_status[band]["start_time"] = None
+        
+        if downloaded_files:
+            if len(downloaded_files) == 1:
+                return True, f"Saved: {downloaded_files[0]} ({total_size:,} bytes)", os.path.join(DOWNLOADS_FOLDER, downloaded_files[0])
+            else:
+                # Format size nicely
+                if total_size > 1024 * 1024 * 1024:
+                    size_str = f"{total_size / (1024*1024*1024):.2f} GB"
+                elif total_size > 1024 * 1024:
+                    size_str = f"{total_size / (1024*1024):.1f} MB"
+                else:
+                    size_str = f"{total_size:,} bytes"
+                return True, f"Saved {len(downloaded_files)} files ({size_str} total)", DOWNLOADS_FOLDER
+        else:
+            return False, "Download failed", None
     
     except Exception as e:
         capture_status[band]["running"] = False
@@ -1045,6 +1097,51 @@ HTML_TEMPLATE = """
             {% endif %}
         </header>
         
+        <!-- File Split Settings -->
+        <div class="file-split-settings" style="display: flex; justify-content: center; align-items: center; gap: 1rem; margin-bottom: 1.5rem; padding: 1rem; background: var(--bg-card); border-radius: 0.75rem; border: 1px solid var(--border-color); flex-wrap: wrap;">
+            <div style="display: flex; align-items: center; gap: 0.75rem;">
+                <label class="toggle-switch" style="position: relative; display: inline-block; width: 50px; height: 26px;">
+                    <input type="checkbox" id="fileSplitEnabled" onchange="updateFileSplit()" style="opacity: 0; width: 0; height: 0;">
+                    <span class="toggle-slider" style="position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: var(--border-color); transition: 0.3s; border-radius: 26px;"></span>
+                </label>
+                <span style="font-weight: 500;">Split Files by Size</span>
+            </div>
+            <div id="fileSplitSizeContainer" style="display: flex; align-items: center; gap: 0.5rem; opacity: 0.5;">
+                <span style="color: var(--text-secondary);">Max size:</span>
+                <select id="fileSplitSize" onchange="updateFileSplit()" style="padding: 0.4rem 0.75rem; background: var(--bg-dark); border: 1px solid var(--border-color); border-radius: 0.35rem; color: var(--text-primary); font-family: 'JetBrains Mono', monospace;">
+                    <option value="50">50 MB</option>
+                    <option value="100">100 MB</option>
+                    <option value="200" selected>200 MB</option>
+                    <option value="500">500 MB</option>
+                    <option value="1000">1 GB</option>
+                </select>
+                <span style="color: var(--text-secondary); font-size: 0.85rem;">per file</span>
+            </div>
+            <div id="fileSplitStatus" style="font-size: 0.85rem; color: var(--text-secondary); font-family: 'JetBrains Mono', monospace;">
+                📁 Continuous capture (no split)
+            </div>
+        </div>
+        
+        <style>
+            .toggle-switch input:checked + .toggle-slider {
+                background: linear-gradient(135deg, var(--accent-2g), var(--accent-5g));
+            }
+            .toggle-switch .toggle-slider:before {
+                position: absolute;
+                content: "";
+                height: 20px;
+                width: 20px;
+                left: 3px;
+                bottom: 3px;
+                background-color: white;
+                transition: 0.3s;
+                border-radius: 50%;
+            }
+            .toggle-switch input:checked + .toggle-slider:before {
+                transform: translateX(24px);
+            }
+        </style>
+        
         <div class="main-controls">
             <button class="btn btn-start-all" onclick="startAll()">
                 <svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1259,6 +1356,9 @@ HTML_TEMPLATE = """
         
         <div class="download-path">
             📁 Capture files will be saved to: <strong>{{ download_path }}</strong>
+            <div id="splitFileNote" style="font-size: 0.8rem; margin-top: 0.5rem; color: var(--text-secondary); display: none;">
+                💡 When file split is enabled, files will be named: <code style="background: rgba(0,0,0,0.3); padding: 0.2rem 0.4rem; border-radius: 0.25rem;">{BAND}_sniffer_{timestamp}_part001.pcap</code>
+            </div>
         </div>
     </div>
     
@@ -1625,6 +1725,83 @@ HTML_TEMPLATE = """
         // Load config on page load (after connection is verified)
         setTimeout(loadCurrentWifiConfig, 1000);
         
+        // ============== File Split Settings ==============
+        
+        // Load file split settings on page load
+        async function loadFileSplitSettings() {
+            try {
+                const response = await fetch('/api/file_split');
+                const data = await response.json();
+                
+                const checkbox = document.getElementById('fileSplitEnabled');
+                const sizeSelect = document.getElementById('fileSplitSize');
+                const sizeContainer = document.getElementById('fileSplitSizeContainer');
+                const statusDiv = document.getElementById('fileSplitStatus');
+                const splitNote = document.getElementById('splitFileNote');
+                
+                checkbox.checked = data.enabled;
+                sizeSelect.value = data.size_mb;
+                
+                // Update UI state
+                if (data.enabled) {
+                    sizeContainer.style.opacity = '1';
+                    statusDiv.innerHTML = `✂️ Split enabled: <strong>${data.size_mb} MB</strong> per file`;
+                    statusDiv.style.color = 'var(--accent-2g)';
+                    if (splitNote) splitNote.style.display = 'block';
+                } else {
+                    sizeContainer.style.opacity = '0.5';
+                    statusDiv.innerHTML = '📁 Continuous capture (no split)';
+                    statusDiv.style.color = 'var(--text-secondary)';
+                    if (splitNote) splitNote.style.display = 'none';
+                }
+            } catch (e) {
+                console.error('Failed to load file split settings:', e);
+            }
+        }
+        
+        // Update file split settings
+        async function updateFileSplit() {
+            const checkbox = document.getElementById('fileSplitEnabled');
+            const sizeSelect = document.getElementById('fileSplitSize');
+            const sizeContainer = document.getElementById('fileSplitSizeContainer');
+            const statusDiv = document.getElementById('fileSplitStatus');
+            const splitNote = document.getElementById('splitFileNote');
+            
+            const enabled = checkbox.checked;
+            const size_mb = parseInt(sizeSelect.value);
+            
+            // Update UI immediately
+            if (enabled) {
+                sizeContainer.style.opacity = '1';
+                statusDiv.innerHTML = `✂️ Split enabled: <strong>${size_mb} MB</strong> per file`;
+                statusDiv.style.color = 'var(--accent-2g)';
+                if (splitNote) splitNote.style.display = 'block';
+            } else {
+                sizeContainer.style.opacity = '0.5';
+                statusDiv.innerHTML = '📁 Continuous capture (no split)';
+                statusDiv.style.color = 'var(--text-secondary)';
+                if (splitNote) splitNote.style.display = 'none';
+            }
+            
+            try {
+                const response = await fetch('/api/file_split', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled: enabled, size_mb: size_mb })
+                });
+                const data = await response.json();
+                
+                if (data.success) {
+                    showNotification(data.message, 'success');
+                }
+            } catch (e) {
+                showNotification('Failed to update file split settings: ' + e.message, 'error');
+            }
+        }
+        
+        // Load file split settings on page load
+        loadFileSplitSettings();
+        
         // Diagnose connection
         async function diagnoseConnection() {
             setLoading(true);
@@ -1869,6 +2046,41 @@ def api_sync_time():
         "success": success,
         "message": message,
         "time_info": info
+    })
+
+
+@app.route('/api/file_split', methods=['GET'])
+def api_get_file_split():
+    """Get current file split configuration"""
+    return jsonify({
+        "enabled": file_split_config["enabled"],
+        "size_mb": file_split_config["size_mb"]
+    })
+
+
+@app.route('/api/file_split', methods=['POST'])
+def api_set_file_split():
+    """Update file split configuration"""
+    data = request.get_json()
+    
+    if "enabled" in data:
+        file_split_config["enabled"] = bool(data["enabled"])
+    
+    if "size_mb" in data:
+        size = int(data["size_mb"])
+        # Validate size (minimum 10MB, maximum 2000MB)
+        if size < 10:
+            size = 10
+        elif size > 2000:
+            size = 2000
+        file_split_config["size_mb"] = size
+    
+    return jsonify({
+        "success": True,
+        "enabled": file_split_config["enabled"],
+        "size_mb": file_split_config["size_mb"],
+        "message": f"File split {'enabled' if file_split_config['enabled'] else 'disabled'}" + 
+                   (f" ({file_split_config['size_mb']}MB per file)" if file_split_config['enabled'] else "")
     })
 
 

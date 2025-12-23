@@ -2,7 +2,7 @@
 
 Web-based control panel for WiFi packet capture using OpenWrt Monitor Mode. Supports simultaneous or individual capture of 2.4G / 5G / 6G bands.
 
-**Version:** 1.3 | **Last Updated:** 2024-12-19
+**Version:** 1.6 | **Last Updated:** 2024-12-23
 
 ---
 
@@ -285,13 +285,42 @@ The system uses these SSH options for OpenWrt/Dropbear compatibility:
 
 On OpenWrt, the following command is executed:
 ```bash
+# Normal mode (continuous capture)
 tcpdump -i {interface} -U -s0 -w /tmp/{band}.pcap &
+
+# With file splitting enabled (e.g., 200MB per file)
+tcpdump -i {interface} -U -s0 -w /tmp/{band}.pcap -C 200 &
 ```
 
 - `-i {interface}` - Capture on specific interface (ath0/ath1/ath2)
 - `-U` - Unbuffered output (write packets immediately)
 - `-s0` - Capture full packet (no truncation)
 - `-w` - Write to file
+- `-C {size}` - Rotate file after reaching specified size (in MB)
+
+### File Split Feature
+
+**Why use file splitting?**
+During long capture sessions, pcap files can grow very large, making them difficult to handle and analyze. The file split feature automatically rotates capture files when they reach a specified size.
+
+**How to use:**
+1. Look for the **"Split Files by Size"** toggle in the header area
+2. Enable the toggle to activate file splitting
+3. Select maximum file size: 50MB, 100MB, **200MB (default)**, 500MB, or 1GB
+4. When disabled, capture continues to a single file (no size limit)
+
+**File naming with split enabled:**
+```
+Downloads/
+├── 2G_sniffer_20241223_143000_part001.pcap  (200 MB)
+├── 2G_sniffer_20241223_143000_part002.pcap  (200 MB)
+├── 2G_sniffer_20241223_143000_part003.pcap  (50 MB)
+└── ...
+```
+
+**API endpoints:**
+- `GET /api/file_split` - Get current file split configuration
+- `POST /api/file_split` - Update file split settings (enabled, size_mb)
 
 ### Time Synchronization
 
@@ -364,11 +393,24 @@ ssh-keygen -R 192.168.1.1
 ## 📊 Output Example
 
 After successful capture, you'll see:
+
+**Normal mode (single file per band):**
 ```
 Downloads/
-├── 2G_sniffer_20251219_121737.pcap  (5,209 bytes)
-├── 5G_sniffer_20251219_121741.pcap  (9,811 bytes)
-└── 6G_sniffer_20251219_121744.pcap  (3,456 bytes)
+├── 2G_sniffer_20251223_121737.pcap  (5,209 bytes)
+├── 5G_sniffer_20251223_121741.pcap  (9,811 bytes)
+└── 6G_sniffer_20251223_121744.pcap  (3,456 bytes)
+```
+
+**With file split enabled (multiple files per band):**
+```
+Downloads/
+├── 2G_sniffer_20251223_143000_part001.pcap  (200 MB)
+├── 2G_sniffer_20251223_143000_part002.pcap  (200 MB)
+├── 2G_sniffer_20251223_143000_part003.pcap  (50 MB)
+├── 5G_sniffer_20251223_143005_part001.pcap  (200 MB)
+├── 5G_sniffer_20251223_143005_part002.pcap  (150 MB)
+└── 6G_sniffer_20251223_143010_part001.pcap  (75 MB)
 ```
 
 ---
@@ -384,6 +426,18 @@ If you encounter issues, please collect:
 ---
 
 ## 🔄 Changelog
+
+### v1.6 (2024-12-23)
+- **Added**: File split feature to prevent oversized capture files during long sessions
+  - Toggle switch in UI to enable/disable file splitting
+  - Configurable file size: 50MB, 100MB, 200MB (default), 500MB, 1GB
+  - Uses tcpdump `-C` option for automatic file rotation
+  - Automatic download of all split files when capture stops
+  - Split files named: `{Band}_sniffer_{timestamp}_part001.pcap`
+- **Added**: API endpoints for file split configuration
+  - `GET /api/file_split` - Get current settings
+  - `POST /api/file_split` - Update settings
+- **Updated**: EXE build includes file split feature
 
 ### v1.5 (2024-12-22)
 - **Added**: Environment variable port configuration (`FLASK_PORT`)
