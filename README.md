@@ -2,7 +2,7 @@
 
 Web-based control panel for WiFi packet capture using OpenWrt Monitor Mode. Supports simultaneous or individual capture of 2.4G / 5G / 6G bands.
 
-**Version:** 1.6 | **Last Updated:** 2024-12-23
+**Version:** 1.7 | **Last Updated:** 2024-12-23
 
 ---
 
@@ -194,11 +194,38 @@ Open the downloaded .pcap files with Wireshark for analysis
 
 ## 🔧 Interface Mapping
 
+### Default Mapping
+
 | Band | OpenWrt Interface | SSID | Frequency Range |
 |------|-------------------|------|-----------------|
 | 2.4G | ath0 | RFLab2g | 2.4 GHz (CH 1-14) |
 | 5G | ath2 | RFLab5g | 5 GHz (CH 36-165) |
 | 6G | ath1 | RFLab6g | 6 GHz (CH 1-233) |
+
+### 🔄 Auto-Detection (NEW in v1.7)
+
+**Problem:** Different hardware units may have different interface mappings:
+- **Unit A:** 5G=ath2, 6G=ath1 (default)
+- **Unit B:** 5G=ath1, 6G=ath2 (swapped)
+
+**Solution:** The system now **automatically detects** the correct interface mapping when connecting to OpenWrt.
+
+**How it works:**
+1. On connection, the system queries `iwconfig` to read interface frequencies
+2. Interfaces are automatically mapped based on detected frequency:
+   - Frequency < 3 GHz → 2G
+   - Frequency 3-6 GHz → 5G
+   - Frequency > 6 GHz → 6G
+3. UCI radio mapping (wifi0/wifi1/wifi2) is also auto-detected
+
+**Web UI Indicators:**
+- Header shows: `🔗 Interface: 2G=ath0 | 5G=ath2 | 6G=ath1`
+- Badge shows: `✓ Auto-detected` (green) or `Default` (gray)
+- Click `🔍 Detect` button to manually re-detect
+
+**API Endpoints:**
+- `GET /api/interface_mapping` - Get current mapping and detection status
+- `POST /api/detect_interfaces` - Force re-detection of interface mapping
 
 ---
 
@@ -426,6 +453,21 @@ If you encounter issues, please collect:
 ---
 
 ## 🔄 Changelog
+
+### v1.7 (2024-12-23)
+- **Added**: Auto-detect interface mapping for different hardware units
+  - Automatically detects which athX interface corresponds to which band (2G/5G/6G)
+  - Supports units with different interface configurations (e.g., ath1/ath2 swapped)
+  - Detection via `iwconfig` frequency reading
+  - UCI radio mapping (wifi0/wifi1/wifi2) also auto-detected
+- **Added**: Interface mapping display in Web UI header
+  - Shows current mapping: `2G=ath0 | 5G=ath2 | 6G=ath1`
+  - Status badge: `✓ Auto-detected` or `Default`
+  - Manual re-detect button
+- **Added**: API endpoints for interface mapping
+  - `GET /api/interface_mapping` - Get current mapping
+  - `POST /api/detect_interfaces` - Force re-detection
+- **Fixed**: Channel configuration now works correctly on different hardware units
 
 ### v1.6 (2024-12-23)
 - **Added**: File split feature to prevent oversized capture files during long sessions

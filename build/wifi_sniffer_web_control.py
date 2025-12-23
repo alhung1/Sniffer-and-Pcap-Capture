@@ -13,6 +13,7 @@ import paramiko
 import threading
 import os
 import time
+import re
 from datetime import datetime
 from pathlib import Path
 import socket
@@ -26,11 +27,26 @@ OPENWRT_PASSWORD = None  # None = no password (OpenWrt default), or set "your_pa
 SSH_KEY_PATH = None  # Set path to SSH key if needed
 SSH_PORT = 22
 
-# Interface mapping
+# Interface mapping (default values - will be auto-detected on connection)
 INTERFACES = {
     "2G": "ath0",
     "5G": "ath2", 
     "6G": "ath1"
+}
+
+# UCI wireless interface mapping (OpenWrt) - will be auto-detected
+UCI_WIFI_MAP = {
+    "2G": "wifi0",  # 2.4G radio
+    "5G": "wifi2",  # 5G radio
+    "6G": "wifi1"   # 6G radio
+}
+
+# Auto-detection status
+interface_detection_status = {
+    "detected": False,
+    "last_detection": None,
+    "detection_method": None,
+    "detected_mapping": None
 }
 
 # Download folder (Windows Downloads)
@@ -74,12 +90,248 @@ BANDWIDTHS = {
     "6G": ["EHT20", "EHT40", "EHT80", "EHT160", "EHT320"]
 }
 
-# UCI wireless interface mapping (OpenWrt)
-UCI_WIFI_MAP = {
-    "2G": "wifi0",  # 2.4G radio
-    "5G": "wifi2",  # 5G radio
-    "6G": "wifi1"   # 6G radio
-}
+def detect_interface_mapping():
+    """
+    Auto-detect the interface mapping by querying the OpenWrt device.
+    This function detects which athX interface corresponds to which band (2G/5G/6G)
+    by checking the frequency/channel information from iwconfig and uci config.
+    """
+    global INTERFACES, UCI_WIFI_MAP, interface_detection_status
+    
+    print("[DETECT] Starting interface auto-detection...")
+    
+    try:
+        # Method 1: Use iwconfig to get frequency for each interface
+        # iwconfig output shows frequency which tells us the band
+        success, stdout, stderr = run_ssh_command(
+            "iwconfig 2>/dev/null | grep -E '^ath[0-2]|Frequency'",
+            timeout=10
+        )
+        
+        if success and stdout.strip():
+            # Parse iwconfig output to map interfaces to bands
+            detected = {}
+            lines = stdout.strip().split('\n')
+            current_iface = None
+            
+            for line in lines:
+                line = line.strip()
+                if line.startswith('ath'):
+                    current_iface = line.split()[0]
+                elif 'Frequency' in line and current_iface:
+                    # Extract frequency, e.g., "Frequency:2.437 GHz" or "Frequency:5.18 GHz"
+                    import re
+                    freq_match = re.search(r'Frequency[:\s]*(\d+\.?\d*)', line)
+                    if freq_match:
+                        freq = float(freq_match.group(1))
+                        if freq < 3:  # 2.4 GHz band
+                            detected[current_iface] = "2G"
+                        elif freq < 6:  # 5 GHz band
+                            detected[current_iface] = "5G"
+                        else:  # 6 GHz band
+                            detected[current_iface] = "6G"
+                        print(f"[DETECT] {current_iface}: {freq} GHz -> {detected[current_iface]}")
+            
+            if len(detected) >= 3:
+                # Reverse the mapping: from {iface: band} to {band: iface}
+                new_interfaces = {}
+                for iface, band in detected.items():
+                    new_interfaces[band] = iface
+                
+                # Check if we detected all three bands
+                if "2G" in new_interfaces and "5G" in new_interfaces and "6G" in new_interfaces:
+                    INTERFACES = new_interfaces
+                    interface_detection_status["detected"] = True
+                    interface_detection_status["last_detection"] = datetime.now()
+                    interface_detection_status["detection_method"] = "iwconfig_frequency"
+                    interface_detection_status["detected_mapping"] = dict(INTERFACES)
+                    print(f"[DETECT] Success via iwconfig! Mapping: {INTERFACES}")
+                    
+                    # Now detect UCI radio mapping
+                    detect_uci_wifi_mapping()
+                    return True
+        
+        # Method 2: Use UCI config to detect based on channel/hwmode
+        print("[DETECT] Method 1 failed, trying UCI config method...")
+        success, stdout, stderr = run_ssh_command(
+            "uci show wireless | grep -E 'wifi[0-2]\\.(channel|htmode|band|hwmode)'",
+            timeout=10
+        )
+        
+        if success and stdout.strip():
+            uci_data = {}
+            for line in stdout.strip().split('\n'):
+                # Parse lines like: wireless.wifi0.channel='6'
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    key = key.replace('wireless.', '')
+                    value = value.strip("'\"")
+                    
+                    parts = key.split('.')
+                    if len(parts) == 2:
+                        radio, prop = parts
+                        if radio not in uci_data:
+                            uci_data[radio] = {}
+                        uci_data[radio][prop] = value
+            
+            print(f"[DETECT] UCI data: {uci_data}")
+            
+            # Determine band for each radio based on channel/hwmode/band
+            new_uci_map = {}
+            for radio, config in uci_data.items():
+                band = None
+                
+                # Check 'band' property first (newer OpenWrt)
+                if 'band' in config:
+                    band_val = config['band'].lower()
+                    if band_val == '2g':
+                        band = "2G"
+                    elif band_val == '5g':
+                        band = "5G"
+                    elif band_val == '6g':
+                        band = "6G"
+                
+                # Check hwmode if band not detected
+                if not band and 'hwmode' in config:
+                    hwmode = config['hwmode'].lower()
+                    if 'g' in hwmode and 'a' not in hwmode:
+                        band = "2G"
+                    elif 'a' in hwmode:
+                        # Could be 5G or 6G, need to check channel
+                        channel = int(config.get('channel', 0))
+                        if channel > 0:
+                            if channel <= 14:
+                                band = "2G"
+                            elif channel <= 177:
+                                band = "5G"
+                            else:
+                                band = "6G"
+                
+                # Check channel if still not determined
+                if not band and 'channel' in config:
+                    try:
+                        channel = int(config['channel'])
+                        if channel <= 14:
+                            band = "2G"
+                        elif channel <= 177:
+                            band = "5G"
+                        else:
+                            band = "6G"
+                    except:
+                        pass
+                
+                # Check htmode for EHT320 which is 6G specific
+                if not band and 'htmode' in config:
+                    htmode = config['htmode'].upper()
+                    if 'EHT320' in htmode:
+                        band = "6G"
+                    elif 'EHT160' in htmode or 'VHT160' in htmode:
+                        band = "5G"  # Most likely 5G
+                    elif 'HT20' in htmode or 'HT40' in htmode:
+                        band = "2G"  # Most likely 2.4G
+                
+                if band:
+                    new_uci_map[band] = radio
+                    print(f"[DETECT] {radio} -> {band}")
+            
+            # Also need to detect interface mapping from UCI
+            if len(new_uci_map) >= 3:
+                UCI_WIFI_MAP.update(new_uci_map)
+                
+                # Try to get interface mapping from UCI
+                success, stdout, stderr = run_ssh_command(
+                    "uci show wireless | grep -E 'default_radio[0-2].*ifname'",
+                    timeout=10
+                )
+                
+                if success and stdout.strip():
+                    for line in stdout.strip().split('\n'):
+                        if 'ifname=' in line:
+                            # Extract radio number and interface name
+                            import re
+                            match = re.search(r'default_radio(\d)', line)
+                            iface_match = re.search(r"ifname='?(ath\d)'?", line)
+                            if match and iface_match:
+                                radio_num = match.group(1)
+                                iface = iface_match.group(1)
+                                radio = f"wifi{radio_num}"
+                                
+                                # Find which band this radio is
+                                for band, uci_radio in UCI_WIFI_MAP.items():
+                                    if uci_radio == radio:
+                                        INTERFACES[band] = iface
+                                        print(f"[DETECT] {band} -> {iface} (from UCI)")
+                
+                interface_detection_status["detected"] = True
+                interface_detection_status["last_detection"] = datetime.now()
+                interface_detection_status["detection_method"] = "uci_config"
+                interface_detection_status["detected_mapping"] = dict(INTERFACES)
+                print(f"[DETECT] Success via UCI! Mapping: {INTERFACES}")
+                return True
+        
+        print("[DETECT] Auto-detection failed, using default mapping")
+        return False
+        
+    except Exception as e:
+        print(f"[DETECT] Error during detection: {e}")
+        return False
+
+
+def detect_uci_wifi_mapping():
+    """Detect the UCI radio mapping (wifi0/wifi1/wifi2) based on detected interfaces"""
+    global UCI_WIFI_MAP
+    
+    try:
+        # Query UCI to find which wifiX corresponds to which band
+        success, stdout, stderr = run_ssh_command(
+            "uci show wireless | grep -E 'wifi[0-2]\\.(channel|band)'",
+            timeout=10
+        )
+        
+        if success and stdout.strip():
+            uci_data = {}
+            for line in stdout.strip().split('\n'):
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    key = key.replace('wireless.', '')
+                    value = value.strip("'\"")
+                    
+                    parts = key.split('.')
+                    if len(parts) == 2:
+                        radio, prop = parts
+                        if radio not in uci_data:
+                            uci_data[radio] = {}
+                        uci_data[radio][prop] = value
+            
+            # Map radios to bands based on channel
+            for radio, config in uci_data.items():
+                try:
+                    channel = int(config.get('channel', 0))
+                    if channel > 0:
+                        if channel <= 14:
+                            UCI_WIFI_MAP["2G"] = radio
+                        elif channel <= 177:
+                            UCI_WIFI_MAP["5G"] = radio
+                        else:
+                            UCI_WIFI_MAP["6G"] = radio
+                        print(f"[UCI DETECT] {radio} (CH{channel}) -> {get_band_from_channel(channel)}")
+                except:
+                    pass
+            
+            print(f"[UCI DETECT] UCI mapping: {UCI_WIFI_MAP}")
+            
+    except Exception as e:
+        print(f"[UCI DETECT] Error: {e}")
+
+
+def get_band_from_channel(channel):
+    """Get band name from channel number"""
+    if channel <= 14:
+        return "2G"
+    elif channel <= 177:
+        return "5G"
+    else:
+        return "6G"
 
 
 def run_ssh_command(command, timeout=30):
@@ -220,6 +472,11 @@ def test_connection():
     
     if success and "connected" in stdout:
         print("[SSH] Connection test: SUCCESS")
+        
+        # Auto-detect interface mapping if not yet detected
+        if not interface_detection_status["detected"]:
+            detect_interface_mapping()
+        
         return True
     else:
         last_connection_error = stderr or "Connection failed"
@@ -1075,6 +1332,18 @@ HTML_TEMPLATE = """
                 <span id="connectionText">{{ '192.168.1.1 Connected' if connected else '192.168.1.1 Disconnected - Click to diagnose' }}</span>
             </div>
             
+            <!-- Interface Mapping Status -->
+            <div class="interface-mapping-status" style="margin-top: 0.75rem; display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.5rem 1rem; background: var(--bg-card); border-radius: 2rem; border: 1px solid var(--border-color); font-size: 0.85rem; flex-wrap: wrap;">
+                <span style="color: var(--text-secondary);">🔗 Interface:</span>
+                <span id="mapping2G" style="font-family: 'JetBrains Mono', monospace; color: var(--accent-2g);">2G={{ interfaces['2G'] }}</span>
+                <span style="color: var(--text-secondary);">|</span>
+                <span id="mapping5G" style="font-family: 'JetBrains Mono', monospace; color: var(--accent-5g);">5G={{ interfaces['5G'] }}</span>
+                <span style="color: var(--text-secondary);">|</span>
+                <span id="mapping6G" style="font-family: 'JetBrains Mono', monospace; color: var(--accent-6g);">6G={{ interfaces['6G'] }}</span>
+                <span id="detectionBadge" style="padding: 0.2rem 0.5rem; border-radius: 1rem; font-size: 0.75rem; font-weight: 600; {{ 'background: rgba(34, 197, 94, 0.2); color: var(--accent-2g);' if detection_status.detected else 'background: rgba(148, 163, 184, 0.2); color: var(--text-secondary);' }}">{{ '✓ Auto-detected' if detection_status.detected else 'Default' }}</span>
+                <button onclick="redetectInterfaces()" style="background: none; border: 1px solid var(--border-color); color: var(--text-secondary); padding: 0.25rem 0.5rem; border-radius: 0.25rem; cursor: pointer; font-size: 0.75rem;" title="Re-detect interface mapping">🔍 Detect</button>
+            </div>
+            
             <!-- Time Sync Status -->
             <div class="time-sync-status" id="timeSyncStatus" style="margin-top: 0.75rem; display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.5rem 1rem; background: var(--bg-card); border-radius: 2rem; border: 1px solid var(--border-color); font-size: 0.85rem;">
                 <span style="color: var(--text-secondary);">🕐 PC:</span>
@@ -1180,7 +1449,7 @@ HTML_TEMPLATE = """
                         <div class="band-icon band-icon-2g">2.4G</div>
                         <div class="band-info">
                             <h3>2.4 GHz Band</h3>
-                            <span class="interface">ath0</span>
+                            <span class="interface" id="iface-2g">{{ interfaces['2G'] }}</span>
                         </div>
                     </div>
                     <span class="status-badge {{ 'status-running' if status['2G']['running'] else 'status-idle' }}" id="status-2g">
@@ -1240,7 +1509,7 @@ HTML_TEMPLATE = """
                         <div class="band-icon band-icon-5g">5G</div>
                         <div class="band-info">
                             <h3>5 GHz Band</h3>
-                            <span class="interface">ath2</span>
+                            <span class="interface" id="iface-5g">{{ interfaces['5G'] }}</span>
                         </div>
                     </div>
                     <span class="status-badge {{ 'status-running' if status['5G']['running'] else 'status-idle' }}" id="status-5g">
@@ -1300,7 +1569,7 @@ HTML_TEMPLATE = """
                         <div class="band-icon band-icon-6g">6G</div>
                         <div class="band-info">
                             <h3>6 GHz Band</h3>
-                            <span class="interface">ath1</span>
+                            <span class="interface" id="iface-6g">{{ interfaces['6G'] }}</span>
                         </div>
                     </div>
                     <span class="status-badge {{ 'status-running' if status['6G']['running'] else 'status-idle' }}" id="status-6g">
@@ -1802,6 +2071,40 @@ HTML_TEMPLATE = """
         // Load file split settings on page load
         loadFileSplitSettings();
         
+        // Re-detect interface mapping
+        async function redetectInterfaces() {
+            setLoading(true);
+            try {
+                const response = await fetch('/api/detect_interfaces', { method: 'POST' });
+                const data = await response.json();
+                
+                if (data.success) {
+                    // Update UI with new mapping
+                    document.getElementById('mapping2G').textContent = `2G=${data.interfaces['2G']}`;
+                    document.getElementById('mapping5G').textContent = `5G=${data.interfaces['5G']}`;
+                    document.getElementById('mapping6G').textContent = `6G=${data.interfaces['6G']}`;
+                    
+                    // Update card interface labels
+                    document.getElementById('iface-2g').textContent = data.interfaces['2G'];
+                    document.getElementById('iface-5g').textContent = data.interfaces['5G'];
+                    document.getElementById('iface-6g').textContent = data.interfaces['6G'];
+                    
+                    // Update detection badge
+                    const badge = document.getElementById('detectionBadge');
+                    badge.textContent = '✓ Auto-detected';
+                    badge.style.background = 'rgba(34, 197, 94, 0.2)';
+                    badge.style.color = 'var(--accent-2g)';
+                    
+                    showNotification(data.message, 'success');
+                } else {
+                    showNotification('Interface detection failed. Using default mapping.', 'error');
+                }
+            } catch (e) {
+                showNotification('Detection error: ' + e.message, 'error');
+            }
+            setLoading(false);
+        }
+        
         // Diagnose connection
         async function diagnoseConnection() {
             setLoading(true);
@@ -1877,6 +2180,13 @@ def index():
             minutes, seconds = divmod(int(delta.total_seconds()), 60)
             status[band]["duration"] = f"{minutes:02d}:{seconds:02d}"
     
+    # Prepare detection status for template
+    detection_status = {
+        "detected": interface_detection_status["detected"],
+        "method": interface_detection_status["detection_method"],
+        "last_detection": interface_detection_status["last_detection"].strftime("%Y-%m-%d %H:%M:%S") if interface_detection_status["last_detection"] else None
+    }
+    
     return render_template_string(
         HTML_TEMPLATE,
         connected=connected,
@@ -1884,7 +2194,10 @@ def index():
         channels=CHANNELS,
         bandwidths=BANDWIDTHS,
         channel_config=channel_config,
-        download_path=DOWNLOADS_FOLDER
+        download_path=DOWNLOADS_FOLDER,
+        interfaces=INTERFACES,
+        uci_wifi_map=UCI_WIFI_MAP,
+        detection_status=detection_status
     )
 
 
@@ -2084,6 +2397,45 @@ def api_set_file_split():
     })
 
 
+@app.route('/api/interface_mapping')
+def api_get_interface_mapping():
+    """Get current interface mapping and detection status"""
+    return jsonify({
+        "interfaces": INTERFACES,
+        "uci_wifi_map": UCI_WIFI_MAP,
+        "detection_status": {
+            "detected": interface_detection_status["detected"],
+            "last_detection": interface_detection_status["last_detection"].strftime("%Y-%m-%d %H:%M:%S") if interface_detection_status["last_detection"] else None,
+            "detection_method": interface_detection_status["detection_method"],
+            "detected_mapping": interface_detection_status["detected_mapping"]
+        }
+    })
+
+
+@app.route('/api/detect_interfaces', methods=['POST'])
+def api_detect_interfaces():
+    """Force re-detection of interface mapping"""
+    global interface_detection_status
+    
+    # Reset detection status to force re-detection
+    interface_detection_status["detected"] = False
+    
+    # Run detection
+    success = detect_interface_mapping()
+    
+    return jsonify({
+        "success": success,
+        "interfaces": INTERFACES,
+        "uci_wifi_map": UCI_WIFI_MAP,
+        "detection_status": {
+            "detected": interface_detection_status["detected"],
+            "last_detection": interface_detection_status["last_detection"].strftime("%Y-%m-%d %H:%M:%S") if interface_detection_status["last_detection"] else None,
+            "detection_method": interface_detection_status["detection_method"]
+        },
+        "message": f"Detection {'successful' if success else 'failed'}. Mapping: 2G={INTERFACES.get('2G')}, 5G={INTERFACES.get('5G')}, 6G={INTERFACES.get('6G')}"
+    })
+
+
 if __name__ == '__main__':
     # 從環境變數讀取 PORT，預設 5000
     SERVER_PORT = int(os.environ.get('FLASK_PORT', 5000))
@@ -2093,9 +2445,13 @@ if __name__ == '__main__':
     print("=" * 60)
     print(f"  OpenWrt Host: {OPENWRT_HOST}")
     print(f"  Download Folder: {DOWNLOADS_FOLDER}")
-    print(f"  Interface Mapping:")
+    print(f"  Default Interface Mapping (will auto-detect on connection):")
     for band, iface in INTERFACES.items():
         print(f"    - {band}: {iface}")
+    print("-" * 60)
+    print("  NOTE: Interface mapping will be auto-detected when")
+    print("  connected to OpenWrt. This ensures channel config")
+    print("  works correctly on different hardware units.")
     print("=" * 60)
     print(f"  Starting web server on http://127.0.0.1:{SERVER_PORT}")
     print("=" * 60)
