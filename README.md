@@ -305,8 +305,11 @@ The system uses these SSH options for OpenWrt/Dropbear compatibility:
 ```
 -o StrictHostKeyChecking=no
 -o HostKeyAlgorithms=+ssh-rsa
--o PubkeyAcceptedAlgorithms=+ssh-rsa
 ```
+
+Notes:
+- Some older OpenSSH builds (e.g. `OpenSSH_for_Windows_8.1p1`) do **not** support `PubkeyAcceptedAlgorithms`.
+- The app auto-detects whether to use `PubkeyAcceptedAlgorithms` or the legacy alias `PubkeyAcceptedKeyTypes`, and will fall back safely if neither is supported.
 
 ### Capture Command
 

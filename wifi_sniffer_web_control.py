@@ -334,35 +334,130 @@ def get_band_from_channel(channel):
         return "6G"
 
 
+# ============== SSH helpers (Windows/OpenSSH compatibility) ==============
+_SSH_PUBKEY_ACCEPT_OPTION = None  # "PubkeyAcceptedAlgorithms" | "PubkeyAcceptedKeyTypes" | None
+
+
+def _ssh_creationflags():
+    """Hide console window on Windows when spawning ssh."""
+    import subprocess
+    import sys
+    if sys.platform == "win32" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+        return subprocess.CREATE_NO_WINDOW
+    return 0
+
+
+def _ssh_null_device_path():
+    """Return a null device path compatible with the current OS."""
+    import sys
+    return "NUL" if sys.platform == "win32" else "/dev/null"
+
+
+def _detect_pubkey_accept_option():
+    """
+    Detect which ssh_config option is supported by the local OpenSSH client.
+    - Newer OpenSSH: PubkeyAcceptedAlgorithms
+    - Older OpenSSH (e.g., OpenSSH_for_Windows_8.1p1): PubkeyAcceptedKeyTypes
+    """
+    global _SSH_PUBKEY_ACCEPT_OPTION
+    if _SSH_PUBKEY_ACCEPT_OPTION is not None:
+        return _SSH_PUBKEY_ACCEPT_OPTION
+
+    import subprocess
+
+    creationflags = _ssh_creationflags()
+    for opt in ("PubkeyAcceptedAlgorithms", "PubkeyAcceptedKeyTypes"):
+        try:
+            # -G prints final configuration without connecting; it fails fast for bad options.
+            probe = subprocess.run(
+                ["ssh", "-G", "-o", f"{opt}=+ssh-rsa", "dummy"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=creationflags,
+            )
+            if probe.returncode == 0:
+                _SSH_PUBKEY_ACCEPT_OPTION = opt
+                return _SSH_PUBKEY_ACCEPT_OPTION
+        except Exception:
+            continue
+
+    _SSH_PUBKEY_ACCEPT_OPTION = None
+    return None
+
+
+def _build_ssh_base_cmd(timeout=None, batch_mode=True, include_pubkey_accept=True):
+    """Build a robust ssh command line for connecting to OpenWrt/Dropbear."""
+    ssh_cmd = [
+        "ssh",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        f"UserKnownHostsFile={_ssh_null_device_path()}",
+        "-o",
+        "HostKeyAlgorithms=+ssh-rsa",
+    ]
+
+    if include_pubkey_accept:
+        opt = _detect_pubkey_accept_option()
+        if opt:
+            ssh_cmd += ["-o", f"{opt}=+ssh-rsa"]
+
+    if timeout is not None:
+        ssh_cmd += ["-o", f"ConnectTimeout={timeout}"]
+
+    if batch_mode:
+        ssh_cmd += ["-o", "BatchMode=yes"]
+
+    # Respect configured port and optional key path
+    ssh_cmd += ["-p", str(SSH_PORT)]
+    if SSH_KEY_PATH:
+        ssh_cmd += ["-i", SSH_KEY_PATH, "-o", "IdentitiesOnly=yes"]
+
+    ssh_cmd += [f"{OPENWRT_USER}@{OPENWRT_HOST}"]
+    return ssh_cmd
+
+
 def run_ssh_command(command, timeout=30):
     """Run SSH command using system ssh (supports legacy OpenWrt/Dropbear)"""
     import subprocess
-    import sys
-    
-    ssh_cmd = [
-        "ssh",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "HostKeyAlgorithms=+ssh-rsa",
-        "-o", "PubkeyAcceptedAlgorithms=+ssh-rsa",
-        "-o", f"ConnectTimeout={timeout}",
-        "-o", "BatchMode=yes",
-        f"{OPENWRT_USER}@{OPENWRT_HOST}",
-        command
-    ]
-    
+
     # Hide console window on Windows
-    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-    
+    creationflags = _ssh_creationflags()
+
+    # Try with detected pubkey option first; if local OpenSSH doesn't support it, retry without it.
+    attempts = [
+        _build_ssh_base_cmd(timeout=timeout, batch_mode=True, include_pubkey_accept=True),
+        _build_ssh_base_cmd(timeout=timeout, batch_mode=True, include_pubkey_accept=False),
+    ]
+
     try:
-        result = subprocess.run(
-            ssh_cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            creationflags=creationflags
-        )
-        return result.returncode == 0, result.stdout, result.stderr
+        last_result = None
+        for base_cmd in attempts:
+            ssh_cmd = base_cmd + [command]
+            result = subprocess.run(
+                ssh_cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                creationflags=creationflags,
+            )
+            last_result = result
+            if result.returncode == 0:
+                return True, result.stdout, result.stderr
+
+            # If the pubkey option was rejected at runtime, clear cache and retry without it.
+            err = (result.stderr or "").lower()
+            if "bad configuration option" in err and (
+                "pubkeyacceptedalgorithms" in err or "pubkeyacceptedkeytypes" in err
+            ):
+                global _SSH_PUBKEY_ACCEPT_OPTION
+                _SSH_PUBKEY_ACCEPT_OPTION = None
+                continue
+
+        if last_result is None:
+            return False, "", "SSH command failed (no attempts executed)"
+        return False, last_result.stdout, last_result.stderr
     except subprocess.TimeoutExpired:
         return False, "", "Command timeout"
     except Exception as e:
@@ -372,21 +467,12 @@ def run_ssh_command(command, timeout=30):
 def run_ssh_command_background(command):
     """Start SSH command in background, return process"""
     import subprocess
-    import sys
-    
-    ssh_cmd = [
-        "ssh",
-        "-o", "StrictHostKeyChecking=no", 
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "HostKeyAlgorithms=+ssh-rsa",
-        "-o", "PubkeyAcceptedAlgorithms=+ssh-rsa",
-        f"{OPENWRT_USER}@{OPENWRT_HOST}",
-        command
-    ]
-    
+
+    ssh_cmd = _build_ssh_base_cmd(timeout=10, batch_mode=True, include_pubkey_accept=True) + [command]
+
     # Hide console window on Windows
-    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-    
+    creationflags = _ssh_creationflags()
+
     try:
         process = subprocess.Popen(
             ssh_cmd,
@@ -403,22 +489,13 @@ def run_ssh_command_background(command):
 def download_file_scp(remote_path, local_path):
     """Download file using SSH cat pipe (OpenWrt doesn't have sftp-server)"""
     import subprocess
-    import sys
-    
+
     # Use SSH + cat to pipe binary file content (like original batch files)
-    ssh_cmd = [
-        "ssh",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null", 
-        "-o", "HostKeyAlgorithms=+ssh-rsa",
-        "-o", "PubkeyAcceptedAlgorithms=+ssh-rsa",
-        f"{OPENWRT_USER}@{OPENWRT_HOST}",
-        f"cat {remote_path}"
-    ]
-    
+    ssh_cmd = _build_ssh_base_cmd(timeout=10, batch_mode=True, include_pubkey_accept=True) + [f"cat {remote_path}"]
+
     # Hide console window on Windows
-    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-    
+    creationflags = _ssh_creationflags()
+
     try:
         print(f"[DOWNLOAD] Downloading {remote_path} to {local_path}")
         with open(local_path, 'wb') as f:
