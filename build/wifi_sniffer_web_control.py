@@ -419,15 +419,26 @@ def _build_ssh_base_cmd(timeout=None, batch_mode=True, include_pubkey_accept=Tru
 
 
 def run_ssh_command(command, timeout=30):
-    """Run SSH command - uses paramiko when password is set (including empty), system ssh otherwise"""
+    """Run SSH command - tries system ssh first, falls back to paramiko if needed"""
     
-    # If password is set (including empty string ""), use paramiko (supports password auth)
-    # None means "use system ssh with SSH key"
-    if OPENWRT_PASSWORD is not None:
-        return _run_ssh_command_paramiko(command, timeout)
+    # For empty password or no password: try system ssh first (works better with Dropbear)
+    # For actual password: try paramiko first, then system ssh
     
-    # Otherwise use system ssh (for SSH key auth)
-    return _run_ssh_command_system(command, timeout)
+    if OPENWRT_PASSWORD is None or OPENWRT_PASSWORD == "":
+        # No password or empty password: use system ssh (better Dropbear compatibility)
+        # Try without BatchMode first (allows empty password auth)
+        success, stdout, stderr = _run_ssh_command_system_no_batch(command, timeout)
+        if success:
+            return success, stdout, stderr
+        # Fallback to BatchMode (for SSH key auth)
+        return _run_ssh_command_system(command, timeout)
+    else:
+        # Has password: try paramiko first
+        success, stdout, stderr = _run_ssh_command_paramiko(command, timeout)
+        if success:
+            return success, stdout, stderr
+        # Fallback to system ssh (in case paramiko fails with Dropbear)
+        return _run_ssh_command_system_no_batch(command, timeout)
 
 
 def _run_ssh_command_paramiko(command, timeout=30):
@@ -457,8 +468,55 @@ def _run_ssh_command_paramiko(command, timeout=30):
         return False, "", str(e)
 
 
+def _run_ssh_command_system_no_batch(command, timeout=30):
+    """Run SSH command using system ssh WITHOUT BatchMode (allows password prompts/empty auth)"""
+    import subprocess
+
+    # Hide console window on Windows
+    creationflags = _ssh_creationflags()
+
+    # Build command without BatchMode - this allows empty password authentication
+    ssh_cmd = _build_ssh_base_cmd(timeout=timeout, batch_mode=False, include_pubkey_accept=True) + [command]
+
+    try:
+        # Use stdin to send empty password if needed
+        result = subprocess.run(
+            ssh_cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=creationflags,
+            input="\n",  # Send newline for empty password prompt
+        )
+        if result.returncode == 0:
+            return True, result.stdout, result.stderr
+
+        # Check for bad config option and retry without pubkey accept
+        err = (result.stderr or "").lower()
+        if "bad configuration option" in err:
+            global _SSH_PUBKEY_ACCEPT_OPTION
+            _SSH_PUBKEY_ACCEPT_OPTION = None
+            ssh_cmd = _build_ssh_base_cmd(timeout=timeout, batch_mode=False, include_pubkey_accept=False) + [command]
+            result = subprocess.run(
+                ssh_cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                creationflags=creationflags,
+                input="\n",
+            )
+            if result.returncode == 0:
+                return True, result.stdout, result.stderr
+
+        return False, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        return False, "", "Command timeout"
+    except Exception as e:
+        return False, "", str(e)
+
+
 def _run_ssh_command_system(command, timeout=30):
-    """Run SSH command using system ssh (for SSH key authentication)"""
+    """Run SSH command using system ssh with BatchMode (for SSH key authentication)"""
     import subprocess
 
     # Hide console window on Windows
@@ -506,11 +564,14 @@ def _run_ssh_command_system(command, timeout=30):
 def run_ssh_command_background(command):
     """Start SSH command in background, return process or paramiko channel"""
     
-    # If password is set (including empty string), use paramiko
-    if OPENWRT_PASSWORD is not None:
-        return _run_ssh_background_paramiko(command)
+    # For no password/empty password: use system ssh (better Dropbear compatibility)
+    if OPENWRT_PASSWORD is None or OPENWRT_PASSWORD == "":
+        return _run_ssh_background_system(command)
     
-    # Otherwise use system ssh
+    # Has password: try paramiko, fallback to system ssh
+    result = _run_ssh_background_paramiko(command)
+    if result is not None:
+        return result
     return _run_ssh_background_system(command)
 
 
@@ -568,7 +629,8 @@ def _run_ssh_background_system(command):
     """Start SSH command in background using system ssh"""
     import subprocess
 
-    ssh_cmd = _build_ssh_base_cmd(timeout=10, batch_mode=True, include_pubkey_accept=True) + [command]
+    # Use batch_mode=False for better compatibility with Dropbear (no password)
+    ssh_cmd = _build_ssh_base_cmd(timeout=10, batch_mode=False, include_pubkey_accept=True) + [command]
 
     # Hide console window on Windows
     creationflags = _ssh_creationflags()
@@ -578,6 +640,7 @@ def _run_ssh_background_system(command):
             ssh_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,  # Prevent stdin blocking
             creationflags=creationflags
         )
         return process
@@ -587,13 +650,16 @@ def _run_ssh_background_system(command):
 
 
 def download_file_scp(remote_path, local_path):
-    """Download file using SSH - uses paramiko when password is set (including empty)"""
+    """Download file using SSH - prefers system ssh for better Dropbear compatibility"""
     
-    # If password is set (including empty string), use paramiko
-    if OPENWRT_PASSWORD is not None:
-        return _download_file_paramiko(remote_path, local_path)
+    # For no password/empty password: use system ssh (better Dropbear compatibility)
+    if OPENWRT_PASSWORD is None or OPENWRT_PASSWORD == "":
+        return _download_file_system(remote_path, local_path)
     
-    # Otherwise use system ssh cat pipe
+    # Has password: try paramiko, fallback to system ssh
+    result = _download_file_paramiko(remote_path, local_path)
+    if result:
+        return result
     return _download_file_system(remote_path, local_path)
 
 
@@ -638,11 +704,12 @@ def _download_file_paramiko(remote_path, local_path):
 
 
 def _download_file_system(remote_path, local_path):
-    """Download file using system ssh cat pipe (for SSH key authentication)"""
+    """Download file using system ssh cat pipe (better Dropbear compatibility)"""
     import subprocess
 
-    # Use SSH + cat to pipe binary file content (like original batch files)
-    ssh_cmd = _build_ssh_base_cmd(timeout=10, batch_mode=True, include_pubkey_accept=True) + [f"cat {remote_path}"]
+    # Use SSH + cat to pipe binary file content
+    # Use batch_mode=False for better compatibility with Dropbear (no password)
+    ssh_cmd = _build_ssh_base_cmd(timeout=10, batch_mode=False, include_pubkey_accept=True) + [f"cat {remote_path}"]
 
     # Hide console window on Windows
     creationflags = _ssh_creationflags()
@@ -650,7 +717,7 @@ def _download_file_system(remote_path, local_path):
     try:
         print(f"[DOWNLOAD] Downloading {remote_path} to {local_path}")
         with open(local_path, 'wb') as f:
-            result = subprocess.run(ssh_cmd, stdout=f, stderr=subprocess.PIPE, timeout=120, creationflags=creationflags)
+            result = subprocess.run(ssh_cmd, stdout=f, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, timeout=120, creationflags=creationflags)
         
         if result.returncode == 0 and os.path.exists(local_path):
             size = os.path.getsize(local_path)
