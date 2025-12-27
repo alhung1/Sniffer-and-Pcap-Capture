@@ -419,10 +419,11 @@ def _build_ssh_base_cmd(timeout=None, batch_mode=True, include_pubkey_accept=Tru
 
 
 def run_ssh_command(command, timeout=30):
-    """Run SSH command - uses paramiko when password is set, system ssh otherwise"""
+    """Run SSH command - uses paramiko when password is set (including empty), system ssh otherwise"""
     
-    # If password is set, use paramiko (supports password auth)
-    if OPENWRT_PASSWORD:
+    # If password is set (including empty string ""), use paramiko (supports password auth)
+    # None means "use system ssh with SSH key"
+    if OPENWRT_PASSWORD is not None:
         return _run_ssh_command_paramiko(command, timeout)
     
     # Otherwise use system ssh (for SSH key auth)
@@ -505,8 +506,8 @@ def _run_ssh_command_system(command, timeout=30):
 def run_ssh_command_background(command):
     """Start SSH command in background, return process or paramiko channel"""
     
-    # If password is set, use paramiko
-    if OPENWRT_PASSWORD:
+    # If password is set (including empty string), use paramiko
+    if OPENWRT_PASSWORD is not None:
         return _run_ssh_background_paramiko(command)
     
     # Otherwise use system ssh
@@ -586,10 +587,10 @@ def _run_ssh_background_system(command):
 
 
 def download_file_scp(remote_path, local_path):
-    """Download file using SSH - uses paramiko when password is set"""
+    """Download file using SSH - uses paramiko when password is set (including empty)"""
     
-    # If password is set, use paramiko SFTP
-    if OPENWRT_PASSWORD:
+    # If password is set (including empty string), use paramiko
+    if OPENWRT_PASSWORD is not None:
         return _download_file_paramiko(remote_path, local_path)
     
     # Otherwise use system ssh cat pipe
@@ -1584,16 +1585,19 @@ HTML_TEMPLATE = """
             <div style="margin-top: 1rem; padding: 1rem; background: rgba(239, 68, 68, 0.1); border: 1px solid #ef4444; border-radius: 0.5rem; max-width: 600px; margin-left: auto; margin-right: auto;">
                 <p style="color: #ef4444; margin-bottom: 0.75rem; font-weight: 600;">⚠️ SSH Connection Failed</p>
                 <p style="color: var(--text-secondary); font-size: 0.85rem; margin-bottom: 0.75rem;">
-                    Click the button below to enter your OpenWrt password, or click "Disconnected" above for detailed diagnosis.
+                    Enter your OpenWrt password below, or leave empty if your router has no password set.
                 </p>
                 <div style="display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center;">
-                    <input type="password" id="quickPasswordInput" placeholder="Enter OpenWrt root password" 
+                    <input type="password" id="quickPasswordInput" placeholder="Password (leave empty if none)" 
                         style="flex: 1; min-width: 200px; padding: 0.5rem 0.75rem; background: var(--bg-dark); border: 1px solid var(--border-color); border-radius: 0.35rem; color: var(--text-primary);"
                         onkeypress="if(event.key==='Enter') quickSetPassword()">
                     <button onclick="quickSetPassword()" style="padding: 0.5rem 1rem; background: linear-gradient(135deg, var(--accent-2g), var(--accent-5g)); border: none; border-radius: 0.35rem; color: white; font-weight: 600; cursor: pointer; white-space: nowrap;">
                         🔑 Connect
                     </button>
                 </div>
+                <p style="color: var(--text-secondary); font-size: 0.75rem; margin-top: 0.5rem; margin-bottom: 0;">
+                    💡 Tip: If your OpenWrt uses default settings (no password), just click Connect directly.
+                </p>
             </div>
             {% endif %}
         </header>
@@ -2367,11 +2371,11 @@ HTML_TEMPLATE = """
                         </div>
                         <div style="margin-bottom: 1rem;">
                             <label style="display: block; margin-bottom: 0.5rem; font-weight: 500;">Enter OpenWrt Password:</label>
-                            <input type="password" id="diagnosePasswordInput" placeholder="root password" 
+                            <input type="password" id="diagnosePasswordInput" placeholder="Leave empty if no password" 
                                 style="width: 100%; padding: 0.75rem; background: var(--bg-dark); border: 1px solid var(--border-color); border-radius: 0.5rem; color: var(--text-primary); font-size: 1rem;"
                                 onkeypress="if(event.key==='Enter') setPasswordFromDiagnose()">
                             <div style="margin-top: 0.5rem; font-size: 0.8rem; color: var(--text-secondary);">
-                                Password will be used for this session only (not saved to file)
+                                💡 If your OpenWrt has no password (default), just click Connect directly.
                             </div>
                         </div>
                     `;
@@ -2424,17 +2428,14 @@ HTML_TEMPLATE = """
         
         async function setPasswordFromDiagnose() {
             const input = document.getElementById('diagnosePasswordInput');
-            if (!input || !input.value.trim()) {
-                showNotification('Please enter a password', 'error');
-                return;
-            }
+            const password = input ? input.value : '';
             
             setLoading(true);
             try {
                 const response = await fetch('/api/set_password', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ password: input.value })
+                    body: JSON.stringify({ password: password, allow_empty: true })
                 });
                 const data = await response.json();
                 
@@ -2455,20 +2456,17 @@ HTML_TEMPLATE = """
             setLoading(false);
         }
         
-        // Quick set password from header input
+        // Quick set password from header input (empty password allowed for OpenWrt without password)
         async function quickSetPassword() {
             const input = document.getElementById('quickPasswordInput');
-            if (!input || !input.value.trim()) {
-                showNotification('Please enter a password', 'error');
-                return;
-            }
+            const password = input ? input.value : '';
             
             setLoading(true);
             try {
                 const response = await fetch('/api/set_password', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ password: input.value })
+                    body: JSON.stringify({ password: password, allow_empty: true })
                 });
                 const data = await response.json();
                 
@@ -2724,21 +2722,26 @@ def api_set_password():
     
     data = request.get_json()
     password = data.get('password', '')
+    allow_empty = data.get('allow_empty', False)
     
-    if password:
-        OPENWRT_PASSWORD = password
+    # Set password (even if empty - for OpenWrt without password)
+    # Use empty string "" to indicate "use paramiko with no password"
+    # Use None to indicate "use system ssh with SSH key"
+    if allow_empty or password:
+        OPENWRT_PASSWORD = password  # Can be empty string ""
         # Test connection with new password
         connected = test_connection()
         if connected:
+            msg = "Connected successfully!" if password else "Connected successfully (no password)!"
             return jsonify({
                 "success": True,
-                "message": "Password set successfully! Connection established.",
+                "message": msg,
                 "connected": True
             })
         else:
             return jsonify({
                 "success": False,
-                "message": f"Password saved but connection failed: {last_connection_error}",
+                "message": f"Connection failed: {last_connection_error}",
                 "connected": False
             })
     else:
