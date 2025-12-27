@@ -2,7 +2,7 @@
 
 Web-based control panel for WiFi packet capture using OpenWrt Monitor Mode. Supports simultaneous or individual capture of 2.4G / 5G / 6G bands.
 
-**Version:** 1.8 | **Last Updated:** 2024-12-27
+**Version:** 1.9 | **Last Updated:** 2024-12-27
 
 ---
 
@@ -16,11 +16,10 @@ For deploying on a new computer, follow these steps:
 | 2 | Connect PC to OpenWrt network | Ping 192.168.1.1 |
 | 3 | Double-click `install.bat` | All [OK] messages |
 | 4 | Double-click `start_server.bat` | Browser opens |
-| 5 | If disconnected, enter password in web UI | Click 🔑 Connect |
-| 6 | Check header shows 🟢 Connected | Green dot |
-| 7 | Check time shows ✓ Synced | Green badge |
+| 5 | Check header shows 🟢 Connected | Green dot |
+| 6 | Check time shows ✓ Synced | Green badge |
 
-> **NEW in v1.8:** No need to edit any files! If SSH connection fails, simply enter your OpenWrt password directly in the web interface.
+> **v1.9:** Simplified! Just run `start_server.bat` - no configuration needed. Works automatically with Windows native SSH.
 
 ---
 
@@ -74,19 +73,11 @@ The system uses Windows native SSH with legacy algorithm support for OpenWrt/Dro
 ssh -o StrictHostKeyChecking=no -o HostKeyAlgorithms=+ssh-rsa root@192.168.1.1 "echo connected"
 ```
 
-If your OpenWrt has a password set, you have two options:
+The system uses Windows native SSH which works automatically with OpenWrt's default configuration (no password). 
 
-**Option 1: Web Interface (Recommended - NEW in v1.8)**
-- Simply start the server and open the web page
-- If connection fails, a password input box appears automatically
-- Enter your OpenWrt root password and click **🔑 Connect**
-- Password is used for this session only (not saved to file)
-
-**Option 2: Edit Configuration File**
-```python
-# Edit wifi_sniffer_web_control.py, Line ~26
-OPENWRT_PASSWORD = "your_password"
-```
+If your OpenWrt requires a password, you can either:
+1. **Set up SSH key authentication** (recommended)
+2. **Edit the config file**: Set `OPENWRT_PASSWORD = "your_password"` in `wifi_sniffer_web_control.py` (line ~26)
 
 ---
 
@@ -313,23 +304,19 @@ Open the downloaded .pcap files with Wireshark for analysis
 
 ### SSH Connection Details
 
-The system uses a **dual-track authentication** approach for maximum compatibility:
+The system uses **Windows native SSH** (`C:\Windows\System32\OpenSSH\ssh.exe`) for best compatibility with OpenWrt/Dropbear.
 
-| Authentication | Method | Use Case |
-|----------------|--------|----------|
-| Password | Paramiko (Python library) | When password is set via web UI or config |
-| SSH Key | System SSH command | When no password is set (uses ~/.ssh keys) |
-
-**SSH options for OpenWrt/Dropbear compatibility:**
+**SSH options used:**
 ```
 -o StrictHostKeyChecking=no
 -o HostKeyAlgorithms=+ssh-rsa
+-o ConnectTimeout=10
 ```
 
-**Compatibility Notes:**
-- Older OpenSSH builds (e.g. `OpenSSH_for_Windows_8.1p1`) do **not** support `PubkeyAcceptedAlgorithms`
-- The app auto-detects whether to use `PubkeyAcceptedAlgorithms` or the legacy alias `PubkeyAcceptedKeyTypes`
-- Falls back safely if neither option is supported
+**Compatibility:**
+- ✅ Windows 10 21H2 (OpenSSH 8.1p1)
+- ✅ Windows 11 (newer OpenSSH)
+- ✅ OpenWrt with Dropbear SSH server
 
 ### Capture Command
 
@@ -487,6 +474,22 @@ If you encounter issues, please collect:
 ---
 
 ## 🔄 Changelog
+
+### v1.9 (2024-12-27)
+- **Fixed**: Root cause of SSH connection issues on Windows 10 21H2
+  - Removed `CREATE_NO_WINDOW` flag that was blocking SSH authentication
+  - Simplified SSH command to use minimal options for best Dropbear compatibility
+  - Auto-detect SSH executable path on Windows
+- **Simplified**: Removed password input UI (no longer needed)
+  - Removed `/api/set_password` endpoint
+  - Removed password input box from web interface
+  - System now uses native Windows SSH which handles authentication automatically
+- **Simplified**: Removed paramiko-based SSH functions
+  - All SSH operations now use system `ssh.exe` for best compatibility
+  - Cleaner codebase with ~700 lines removed
+- **Improved**: Better cross-platform Windows compatibility
+  - Works on Windows 10 21H2 with OpenSSH 8.1p1
+  - Works on Windows 11 with newer OpenSSH versions
 
 ### v1.8 (2024-12-27)
 - **Added**: Web-based password input for easier setup on new computers
