@@ -388,31 +388,27 @@ def _detect_pubkey_accept_option():
 
 def _build_ssh_base_cmd(timeout=None, batch_mode=True, include_pubkey_accept=True):
     """Build a robust ssh command line for connecting to OpenWrt/Dropbear."""
+    # Use minimal options that are known to work with Dropbear
+    # Based on successful manual test: ssh -o StrictHostKeyChecking=no -o HostKeyAlgorithms=+ssh-rsa root@192.168.1.1
     ssh_cmd = [
         "ssh",
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        f"UserKnownHostsFile={_ssh_null_device_path()}",
-        "-o",
-        "HostKeyAlgorithms=+ssh-rsa",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "HostKeyAlgorithms=+ssh-rsa",
     ]
 
-    if include_pubkey_accept:
-        opt = _detect_pubkey_accept_option()
-        if opt:
-            ssh_cmd += ["-o", f"{opt}=+ssh-rsa"]
-
+    # Only add timeout if specified (some older SSH versions may have issues)
     if timeout is not None:
         ssh_cmd += ["-o", f"ConnectTimeout={timeout}"]
 
     if batch_mode:
         ssh_cmd += ["-o", "BatchMode=yes"]
 
-    # Respect configured port and optional key path
-    ssh_cmd += ["-p", str(SSH_PORT)]
+    # Respect configured port (only add if non-default)
+    if SSH_PORT != 22:
+        ssh_cmd += ["-p", str(SSH_PORT)]
+    
     if SSH_KEY_PATH:
-        ssh_cmd += ["-i", SSH_KEY_PATH, "-o", "IdentitiesOnly=yes"]
+        ssh_cmd += ["-i", SSH_KEY_PATH]
 
     ssh_cmd += [f"{OPENWRT_USER}@{OPENWRT_HOST}"]
     return ssh_cmd
