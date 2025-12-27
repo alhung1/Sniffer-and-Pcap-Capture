@@ -1432,13 +1432,18 @@ HTML_TEMPLATE = """
             </div>
             {% if not connected %}
             <div style="margin-top: 1rem; padding: 1rem; background: rgba(239, 68, 68, 0.1); border: 1px solid #ef4444; border-radius: 0.5rem; max-width: 600px; margin-left: auto; margin-right: auto;">
-                <p style="color: #ef4444; margin-bottom: 0.5rem; font-weight: 600;">⚠️ SSH Connection Failed</p>
-                <p style="color: var(--text-secondary); font-size: 0.85rem; margin-bottom: 0.5rem;">
-                    To fix: Edit <code style="background: rgba(0,0,0,0.3); padding: 0.2rem 0.4rem; border-radius: 0.25rem;">wifi_sniffer_web_control.py</code> and set:
+                <p style="color: #ef4444; margin-bottom: 0.75rem; font-weight: 600;">⚠️ SSH Connection Failed</p>
+                <p style="color: var(--text-secondary); font-size: 0.85rem; margin-bottom: 0.75rem;">
+                    Click the button below to enter your OpenWrt password, or click "Disconnected" above for detailed diagnosis.
                 </p>
-                <code style="display: block; background: rgba(0,0,0,0.3); padding: 0.5rem; border-radius: 0.25rem; font-size: 0.8rem; color: #22c55e;">
-                    OPENWRT_PASSWORD = "your_password"
-                </code>
+                <div style="display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center;">
+                    <input type="password" id="quickPasswordInput" placeholder="Enter OpenWrt root password" 
+                        style="flex: 1; min-width: 200px; padding: 0.5rem 0.75rem; background: var(--bg-dark); border: 1px solid var(--border-color); border-radius: 0.35rem; color: var(--text-primary);"
+                        onkeypress="if(event.key==='Enter') quickSetPassword()">
+                    <button onclick="quickSetPassword()" style="padding: 0.5rem 1rem; background: linear-gradient(135deg, var(--accent-2g), var(--accent-5g)); border: none; border-radius: 0.35rem; color: white; font-weight: 600; cursor: pointer; white-space: nowrap;">
+                        🔑 Connect
+                    </button>
+                </div>
             </div>
             {% endif %}
         </header>
@@ -2189,24 +2194,143 @@ HTML_TEMPLATE = """
                 const response = await fetch('/api/diagnose');
                 const data = await response.json();
                 
-                let msg = `Connection Diagnosis:\n\n`;
-                msg += `Host: ${data.host}:${data.port}\n`;
-                msg += `User: ${data.user}\n`;
-                msg += `Password Set: ${data.password_set ? 'Yes' : 'No'}\n`;
-                msg += `Ping Test: ${data.ping_test ? '✓ OK' : '✗ Failed'}\n`;
-                msg += `SSH Test: ${data.ssh_test ? '✓ OK' : '✗ Failed'}\n`;
+                // Build diagnosis modal content
+                let statusHtml = `
+                    <div style="background: var(--bg-dark); border-radius: 0.5rem; padding: 1rem; margin-bottom: 1rem; font-family: 'JetBrains Mono', monospace; font-size: 0.9rem;">
+                        <div style="margin-bottom: 0.5rem;"><strong>Host:</strong> ${data.host}:${data.port}</div>
+                        <div style="margin-bottom: 0.5rem;"><strong>User:</strong> ${data.user}</div>
+                        <div style="margin-bottom: 0.5rem;"><strong>Password Set:</strong> ${data.password_set ? '<span style="color: var(--accent-2g);">Yes</span>' : '<span style="color: var(--accent-danger);">No</span>'}</div>
+                        <div style="margin-bottom: 0.5rem;"><strong>SSH Keys Found:</strong> ${data.ssh_keys_found && data.ssh_keys_found.length > 0 ? '<span style="color: var(--accent-2g);">' + data.ssh_keys_found.join(', ') + '</span>' : '<span style="color: var(--text-secondary);">None</span>'}</div>
+                        <div style="margin-bottom: 0.5rem;"><strong>Ping Test:</strong> ${data.ping_test ? '<span style="color: var(--accent-2g);">✓ OK</span>' : '<span style="color: var(--accent-danger);">✗ Failed</span>'}</div>
+                        <div><strong>SSH Test:</strong> ${data.ssh_test ? '<span style="color: var(--accent-2g);">✓ OK</span>' : '<span style="color: var(--accent-danger);">✗ Failed</span>'}</div>
+                        ${data.error ? `<div style="margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--border-color); color: var(--accent-danger);"><strong>Error:</strong> ${data.error}</div>` : ''}
+                    </div>
+                `;
                 
-                if (data.error) {
-                    msg += `\nError: ${data.error}`;
+                // Add solution section if needed
+                let solutionHtml = '';
+                if (!data.ssh_test && data.solution) {
+                    solutionHtml = `
+                        <div style="background: rgba(234, 179, 8, 0.1); border: 1px solid #eab308; border-radius: 0.5rem; padding: 1rem; margin-bottom: 1rem;">
+                            <div style="font-weight: 600; color: #eab308; margin-bottom: 0.5rem;">💡 Solution</div>
+                            <div style="color: var(--text-secondary); font-size: 0.9rem;">${data.solution_text}</div>
+                        </div>
+                        <div style="margin-bottom: 1rem;">
+                            <label style="display: block; margin-bottom: 0.5rem; font-weight: 500;">Enter OpenWrt Password:</label>
+                            <input type="password" id="diagnosePasswordInput" placeholder="root password" 
+                                style="width: 100%; padding: 0.75rem; background: var(--bg-dark); border: 1px solid var(--border-color); border-radius: 0.5rem; color: var(--text-primary); font-size: 1rem;"
+                                onkeypress="if(event.key==='Enter') setPasswordFromDiagnose()">
+                            <div style="margin-top: 0.5rem; font-size: 0.8rem; color: var(--text-secondary);">
+                                Password will be used for this session only (not saved to file)
+                            </div>
+                        </div>
+                    `;
                 }
                 
-                if (!data.password_set && !data.ssh_test) {
-                    msg += `\n\n💡 Solution:\nEdit wifi_sniffer_web_control.py and set:\nOPENWRT_PASSWORD = "your_password"`;
-                }
-                
-                alert(msg);
+                // Show modal
+                showDiagnoseModal(statusHtml, solutionHtml, data.ssh_test);
             } catch (e) {
                 alert('Diagnosis failed: ' + e.message);
+            }
+            setLoading(false);
+        }
+        
+        // Show diagnose modal dialog
+        function showDiagnoseModal(statusHtml, solutionHtml, isConnected) {
+            // Remove existing modal if any
+            const existingModal = document.getElementById('diagnoseModal');
+            if (existingModal) existingModal.remove();
+            
+            const modal = document.createElement('div');
+            modal.id = 'diagnoseModal';
+            modal.style.cssText = 'position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); display: flex; justify-content: center; align-items: center; z-index: 9999;';
+            modal.innerHTML = `
+                <div style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 1rem; padding: 1.5rem; max-width: 500px; width: 90%; max-height: 90vh; overflow-y: auto;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+                        <h3 style="margin: 0; font-size: 1.25rem;">🔍 Connection Diagnosis</h3>
+                        <button onclick="closeDiagnoseModal()" style="background: none; border: none; color: var(--text-secondary); font-size: 1.5rem; cursor: pointer; padding: 0; line-height: 1;">&times;</button>
+                    </div>
+                    ${statusHtml}
+                    ${solutionHtml}
+                    <div style="display: flex; gap: 0.75rem; justify-content: flex-end; margin-top: 1rem;">
+                        ${!isConnected && solutionHtml ? '<button onclick="setPasswordFromDiagnose()" style="padding: 0.75rem 1.5rem; background: linear-gradient(135deg, var(--accent-2g), var(--accent-5g)); border: none; border-radius: 0.5rem; color: white; font-weight: 600; cursor: pointer;">Connect</button>' : ''}
+                        <button onclick="closeDiagnoseModal()" style="padding: 0.75rem 1.5rem; background: var(--bg-dark); border: 1px solid var(--border-color); border-radius: 0.5rem; color: var(--text-primary); cursor: pointer;">${isConnected ? 'OK' : 'Cancel'}</button>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(modal);
+            
+            // Focus password input if exists
+            setTimeout(() => {
+                const pwInput = document.getElementById('diagnosePasswordInput');
+                if (pwInput) pwInput.focus();
+            }, 100);
+        }
+        
+        function closeDiagnoseModal() {
+            const modal = document.getElementById('diagnoseModal');
+            if (modal) modal.remove();
+        }
+        
+        async function setPasswordFromDiagnose() {
+            const input = document.getElementById('diagnosePasswordInput');
+            if (!input || !input.value.trim()) {
+                showNotification('Please enter a password', 'error');
+                return;
+            }
+            
+            setLoading(true);
+            try {
+                const response = await fetch('/api/set_password', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: input.value })
+                });
+                const data = await response.json();
+                
+                if (data.success && data.connected) {
+                    closeDiagnoseModal();
+                    showNotification(data.message, 'success');
+                    // Update connection status
+                    document.getElementById('connectionDot').className = 'status-dot connected';
+                    document.getElementById('connectionText').textContent = '192.168.1.1 Connected';
+                    // Reload page to update all states
+                    setTimeout(() => location.reload(), 1000);
+                } else {
+                    showNotification(data.message, 'error');
+                }
+            } catch (e) {
+                showNotification('Failed to set password: ' + e.message, 'error');
+            }
+            setLoading(false);
+        }
+        
+        // Quick set password from header input
+        async function quickSetPassword() {
+            const input = document.getElementById('quickPasswordInput');
+            if (!input || !input.value.trim()) {
+                showNotification('Please enter a password', 'error');
+                return;
+            }
+            
+            setLoading(true);
+            try {
+                const response = await fetch('/api/set_password', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: input.value })
+                });
+                const data = await response.json();
+                
+                if (data.success && data.connected) {
+                    showNotification(data.message, 'success');
+                    // Reload page to update all states
+                    setTimeout(() => location.reload(), 1000);
+                } else {
+                    showNotification(data.message || 'Connection failed. Please check password.', 'error');
+                }
+            } catch (e) {
+                showNotification('Failed to connect: ' + e.message, 'error');
             }
             setLoading(false);
         }
@@ -2384,6 +2508,15 @@ def api_diagnose():
     """Diagnostic endpoint for troubleshooting connection issues"""
     import subprocess
     import sys
+    from pathlib import Path
+    
+    # Check for SSH keys
+    ssh_dir = Path.home() / ".ssh"
+    ssh_keys_found = []
+    for key_name in ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"]:
+        key_path = ssh_dir / key_name
+        if key_path.exists():
+            ssh_keys_found.append(key_name)
     
     results = {
         "host": OPENWRT_HOST,
@@ -2392,9 +2525,12 @@ def api_diagnose():
         "password_set": OPENWRT_PASSWORD is not None and OPENWRT_PASSWORD != "",
         "no_password_mode": OPENWRT_PASSWORD is None or OPENWRT_PASSWORD == "",
         "key_path": SSH_KEY_PATH,
+        "ssh_keys_found": ssh_keys_found,
+        "has_ssh_key": len(ssh_keys_found) > 0,
         "ping_test": False,
         "ssh_test": False,
-        "error": None
+        "error": None,
+        "solution": None
     }
     
     # Hide console window on Windows
@@ -2416,7 +2552,52 @@ def api_diagnose():
     results["ssh_test"] = test_connection()
     results["error"] = last_connection_error
     
+    # Provide specific solution based on diagnosis
+    if not results["ping_test"]:
+        results["solution"] = "network"
+        results["solution_text"] = "Cannot reach OpenWrt router. Check network connection and ensure router IP is 192.168.1.1"
+    elif not results["ssh_test"]:
+        if results["has_ssh_key"]:
+            results["solution"] = "key_not_authorized"
+            results["solution_text"] = f"SSH key found ({', '.join(ssh_keys_found)}) but not authorized on OpenWrt. Either add your public key to the router or set a password below."
+        else:
+            results["solution"] = "no_auth"
+            results["solution_text"] = "No SSH key found and no password set. Please enter your OpenWrt root password below."
+    
     return jsonify(results)
+
+
+@app.route('/api/set_password', methods=['POST'])
+def api_set_password():
+    """Set OpenWrt password at runtime (no restart required)"""
+    global OPENWRT_PASSWORD
+    
+    data = request.get_json()
+    password = data.get('password', '')
+    
+    if password:
+        OPENWRT_PASSWORD = password
+        # Test connection with new password
+        connected = test_connection()
+        if connected:
+            return jsonify({
+                "success": True,
+                "message": "Password set successfully! Connection established.",
+                "connected": True
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "message": f"Password saved but connection failed: {last_connection_error}",
+                "connected": False
+            })
+    else:
+        OPENWRT_PASSWORD = None
+        return jsonify({
+            "success": True,
+            "message": "Password cleared (using SSH key authentication)",
+            "connected": test_connection()
+        })
 
 
 @app.route('/api/time_info')
