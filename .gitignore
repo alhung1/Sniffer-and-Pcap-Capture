@@ -1,24 +1,17 @@
-# Byte-compiled / optimized / DLL files
+# Executables
+*.exe
+
+# Python cache
 __pycache__/
 *.py[cod]
 *$py.class
 
-# Executables
-*.exe
-
-# PyInstaller build artifacts
+# Build artifacts
 build/build/
 build/dist/
+build/output/
+*.spec
 
-# Temp files
-*.tmp
-*.log
-
-# IDE
-.vscode/
-.idea/
-
-# OS
-.DS_Store
-Thumbs.db
-
+# Virtual environment
+venv/
+.env/
