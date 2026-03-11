@@ -122,6 +122,8 @@ class SSHConnectionPool:
             self._ssh_exe,
             "-o", "StrictHostKeyChecking=no",
             "-o", "HostKeyAlgorithms=+ssh-rsa",
+            "-o", "PreferredAuthentications=publickey",
+            "-o", "PubkeyAuthentication=yes",
         ]
         
         if timeout is not None:

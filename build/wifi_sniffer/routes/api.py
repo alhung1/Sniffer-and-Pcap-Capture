@@ -5,12 +5,13 @@ REST API endpoints for the WiFi Sniffer application.
 """
 
 import subprocess
+import sys
 from pathlib import Path
 from flask import jsonify, request
 
 from . import api_bp
 from ..capture import capture_manager
-from ..ssh import ssh_pool
+from ..ssh import ssh_pool, run_ssh_command
 from ..cache import (
     status_cache, 
     get_cached_connection_status, 
@@ -22,6 +23,17 @@ from ..config import (
     OPENWRT_HOST, OPENWRT_USER, OPENWRT_PASSWORD,
     SSH_KEY_PATH, SSH_PORT, CHANNELS, BANDWIDTHS
 )
+from .. import perform_startup_cleanup, is_startup_cleanup_done
+
+
+def _get_subprocess_startupinfo():
+    """Get subprocess startupinfo to hide console window on Windows"""
+    if sys.platform == "win32":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0  # SW_HIDE
+        return startupinfo
+    return None
 
 
 @api_bp.route('/status')
@@ -97,6 +109,14 @@ def api_apply_config():
             })
     
     results = capture_manager.apply_all_and_restart_wifi()
+    
+    # Ensure method is set in results
+    if 'method' not in results:
+        if results.get('iwconfig_mode'):
+            results['method'] = 'iwconfig (2G/5G only)'
+        else:
+            results['method'] = 'iwconfig (2G/5G) + cfg80211tool (6G)'
+    
     return jsonify(results)
 
 
@@ -111,49 +131,39 @@ def api_get_wifi_config():
     })
 
 
-@api_bp.route('/get_channel_config')
-def api_get_channel_config():
-    """Get current local channel configuration (cached)"""
-    return jsonify({
-        "success": True,
-        "config": capture_manager.channel_config,
-        "uci_wifi_map": capture_manager.uci_wifi_map
-    })
-
-
 @api_bp.route('/test_connection')
 def api_test_connection():
-    """Test SSH connection to OpenWrt (with caching)"""
+    """Test SSH connection to OpenWrt"""
     # Check cache first
-    cached_status = get_cached_connection_status()
-    if cached_status is not None:
-        connected = cached_status
-    else:
-        # Perform actual test and cache result
-        connected = ssh_pool.test_connection()
-        set_cached_connection_status(connected)
-        
-        # Auto-detect interfaces if connected and not yet detected
-        if connected and not capture_manager.detection_status["detected"]:
-            capture_manager.detect_interfaces()
-            set_cached_interface_mapping(capture_manager.interfaces)
+    cached = get_cached_connection_status()
+    if cached is not None:
+        return jsonify(cached)
     
-    return jsonify({
-        "connected": connected,
+    connected = ssh_pool.test_connection()
+    
+    # Perform startup cleanup on first successful connection
+    if connected and not is_startup_cleanup_done():
+        perform_startup_cleanup()
+        # Auto-detect interfaces if not already detected
+        if not capture_manager.detection_status["detected"]:
+            capture_manager.detect_interfaces()
+    
+    result = {
+        "connected": connected, 
         "host": OPENWRT_HOST,
         "port": SSH_PORT,
         "user": OPENWRT_USER,
         "auth_method": "key" if SSH_KEY_PATH else ("password" if OPENWRT_PASSWORD else "default"),
-        "error": capture_manager.last_connection_error if not connected else None,
-        "cached": cached_status is not None
-    })
+        "error": capture_manager.last_connection_error if not connected else None
+    }
+    
+    set_cached_connection_status(result)
+    return jsonify(result)
 
 
 @api_bp.route('/diagnose')
 def api_diagnose():
-    """Diagnostic endpoint for troubleshooting"""
-    import sys
-    
+    """Diagnostic endpoint for troubleshooting connection issues"""
     # Check for SSH keys
     ssh_dir = Path.home() / ".ssh"
     ssh_keys_found = []
@@ -177,12 +187,8 @@ def api_diagnose():
         "solution": None
     }
     
-    # Get startupinfo for Windows
-    startupinfo = None
-    if sys.platform == "win32":
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = 0
+    # Get startupinfo to hide console window
+    startupinfo = _get_subprocess_startupinfo()
     
     # Test ping
     try:
@@ -200,7 +206,7 @@ def api_diagnose():
     results["ssh_test"] = ssh_pool.test_connection()
     results["error"] = capture_manager.last_connection_error
     
-    # Provide solutions
+    # Provide specific solution based on diagnosis
     if not results["ping_test"]:
         results["solution"] = "network"
         results["solution_text"] = "Cannot reach OpenWrt router. Check: 1) Router is powered on, 2) PC is connected to router network, 3) Router IP is 192.168.1.1"
@@ -213,18 +219,10 @@ def api_diagnose():
 
 @api_bp.route('/time_info')
 def api_time_info():
-    """Get time information from PC and OpenWrt (with caching)"""
-    # Use cache for time info to reduce SSH calls
-    cached_info = status_cache.get('time_info')
-    if cached_info is not None:
-        return jsonify(cached_info)
-    
+    """Get time information from PC and OpenWrt"""
     info = capture_manager.get_time_info()
-    info["last_sync"] = capture_manager.time_sync_status["last_sync"].strftime("%Y-%m-%d %H:%M:%S") if capture_manager.time_sync_status["last_sync"] else None
-    
-    # Cache for 2 seconds
-    status_cache.set('time_info', info, ttl=2)
-    
+    sync_status = capture_manager.time_sync_status
+    info["last_sync"] = sync_status["last_sync"].strftime("%Y-%m-%d %H:%M:%S") if sync_status.get("last_sync") else None
     return jsonify(info)
 
 
@@ -259,6 +257,7 @@ def api_set_file_split():
     
     if "size_mb" in data:
         size = int(data["size_mb"])
+        # Validate size (minimum 10MB, maximum 2000MB)
         if size < 10:
             size = 10
         elif size > 2000:
@@ -269,52 +268,45 @@ def api_set_file_split():
         "success": True,
         "enabled": capture_manager.file_split_config["enabled"],
         "size_mb": capture_manager.file_split_config["size_mb"],
-        "message": f"File split {'enabled' if capture_manager.file_split_config['enabled'] else 'disabled'}" +
+        "message": f"File split {'enabled' if capture_manager.file_split_config['enabled'] else 'disabled'}" + 
                    (f" ({capture_manager.file_split_config['size_mb']}MB per file)" if capture_manager.file_split_config['enabled'] else "")
     })
 
 
 @api_bp.route('/interface_mapping')
 def api_get_interface_mapping():
-    """Get current interface mapping and detection status (with caching)"""
-    # Check cache first
-    cached_mapping = get_cached_interface_mapping()
-    if cached_mapping is not None:
-        interfaces = cached_mapping
-    else:
-        interfaces = capture_manager.interfaces
-    
+    """Get current interface mapping and detection status"""
+    detection = capture_manager.detection_status
     return jsonify({
-        "interfaces": interfaces,
+        "interfaces": capture_manager.interfaces,
         "uci_wifi_map": capture_manager.uci_wifi_map,
-        "channel_config": capture_manager.channel_config,
         "detection_status": {
-            "detected": capture_manager.detection_status["detected"],
-            "last_detection": capture_manager.detection_status["last_detection"].strftime("%Y-%m-%d %H:%M:%S") if capture_manager.detection_status["last_detection"] else None,
-            "detection_method": capture_manager.detection_status["detection_method"],
-            "detected_mapping": capture_manager.detection_status["detected_mapping"]
-        },
-        "cached": cached_mapping is not None
+            "detected": detection["detected"],
+            "last_detection": detection["last_detection"].strftime("%Y-%m-%d %H:%M:%S") if detection.get("last_detection") else None,
+            "detection_method": detection.get("detection_method"),
+            "detected_mapping": detection.get("detected_mapping")
+        }
     })
 
 
 @api_bp.route('/detect_interfaces', methods=['POST'])
 def api_detect_interfaces():
     """Force re-detection of interface mapping"""
-    # Reset detection status
+    # Reset detection status to force re-detection
     capture_manager.detection_status["detected"] = False
     
     # Run detection
     success = capture_manager.detect_interfaces()
     
+    detection = capture_manager.detection_status
     return jsonify({
         "success": success,
         "interfaces": capture_manager.interfaces,
         "uci_wifi_map": capture_manager.uci_wifi_map,
         "detection_status": {
-            "detected": capture_manager.detection_status["detected"],
-            "last_detection": capture_manager.detection_status["last_detection"].strftime("%Y-%m-%d %H:%M:%S") if capture_manager.detection_status["last_detection"] else None,
-            "detection_method": capture_manager.detection_status["detection_method"]
+            "detected": detection["detected"],
+            "last_detection": detection["last_detection"].strftime("%Y-%m-%d %H:%M:%S") if detection.get("last_detection") else None,
+            "detection_method": detection.get("detection_method")
         },
         "message": f"Detection {'successful' if success else 'failed'}. Mapping: 2G={capture_manager.interfaces.get('2G')}, 5G={capture_manager.interfaces.get('5G')}, 6G={capture_manager.interfaces.get('6G')}"
     })

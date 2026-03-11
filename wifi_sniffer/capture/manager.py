@@ -5,6 +5,7 @@ Manages WiFi packet capture sessions with state tracking.
 """
 
 import os
+import re
 import threading
 import time
 from datetime import datetime
@@ -777,131 +778,85 @@ class CaptureManager:
     
     def apply_all_and_restart_wifi(self) -> Dict[str, Any]:
         """
-        Apply all channel configurations and restart wifi.
+        Apply all channel configurations (2G/5G/6G) without wifi load.
         
-        Automatically chooses the best method:
-        - If 6G channel is unchanged: Use iwconfig for 2G/5G (fast, no restart)
-        - If 6G channel is changed: Use UCI + wifi load (full restart)
-        
-        Uses a robust restart sequence:
-        1. Kill any running tcpdump processes first
-        2. Apply UCI changes
-        3. Use 'wifi down; sleep 2; wifi up' for reliable restart
-        4. Poll for interfaces to come up
+        New unified flow:
+        1. Clean up tcpdump
+        2. 2G/5G: iwconfig {interface} Channel {channel}
+        3. 6G: cfg80211tool {6G_interface} channel {channel} 3
+        4. Verify with iwconfig; no UCI commit, no wifi down/up
         """
-        # Step 1: Check if 6G channel has changed
-        current_6g_channel = self._get_current_6g_channel()
-        target_6g_channel = self.channel_config["6G"]["channel"]
-        six_g_changed = (current_6g_channel is None or 
-                        current_6g_channel != target_6g_channel)
+        results = {
+            "success": True,
+            "messages": [],
+            "bands": {},
+            "method": "iwconfig (2G/5G) + cfg80211tool (6G), no wifi load"
+        }
         
-        print(f"[WIFI] 6G channel check: current={current_6g_channel}, target={target_6g_channel}, changed={six_g_changed}")
-        
-        # Step 2: If 6G has not changed, use iwconfig for 2G/5G only
-        if not six_g_changed:
-            print("[WIFI] 6G unchanged, using iwconfig for 2G/5G...")
-            return self.apply_2g_5g_with_iwconfig()
-        
-        # Step 3: 6G has changed, use full UCI + wifi load process
-        print("[WIFI] 6G changed, using full UCI + wifi load process...")
-        results = {"success": True, "messages": [], "bands": {}, "method": "UCI + wifi load (full restart)"}
-        
-        # Step 1: Clean up any running tcpdump processes first
+        # Step 1: Clean up any running tcpdump processes
         results["messages"].append("Cleaning up running processes...")
-        print("[WIFI] Cleaning up tcpdump processes before restart...")
+        print("[WIFI] Cleaning up tcpdump processes...")
         cleanup_success, cleanup_msg = self.cleanup_remote_processes()
         if cleanup_success:
             results["messages"].append("Cleanup completed")
         else:
             results["messages"].append(f"Cleanup warning: {cleanup_msg}")
         
-        # Step 2: Apply channel configuration for each band
-        for band in ["2G", "5G", "6G"]:
-            success, msg = self.apply_channel_config(band)
-            results["bands"][band] = {"success": success, "message": msg}
-            results["messages"].append(f"{band}: {msg}")
+        # Step 2: Apply iwconfig for 2G and 5G
+        for band in ["2G", "5G"]:
+            interface = self.interfaces.get(band)
+            if not interface:
+                results["bands"][band] = {"success": False, "message": f"No interface configured for {band}"}
+                results["messages"].append(f"{band}: No interface configured")
+                results["success"] = False
+                continue
+            
+            target_channel = self.channel_config[band]["channel"]
+            results["messages"].append(f"{band}: Setting channel {target_channel} on {interface}...")
+            print(f"[IWCONFIG] {band}: Setting {interface} to channel {target_channel}")
+            
+            iwconfig_cmd = f"iwconfig {interface} Channel {target_channel}"
+            success, stdout, stderr = run_ssh_command(iwconfig_cmd, timeout=10)
+            
             if not success:
+                results["bands"][band] = {"success": False, "message": f"Failed to set channel: {stderr or stdout}"}
+                results["messages"].append(f"{band}: Failed - {stderr or stdout}")
+                results["success"] = False
+                continue
+            
+            time.sleep(2)
+            actual_channel = self.get_current_channel_from_iwconfig(interface)
+            if actual_channel == target_channel:
+                results["bands"][band] = {"success": True, "message": f"Channel set to {target_channel} (verified)"}
+                results["messages"].append(f"{band}: ✓ Channel {target_channel} set successfully")
+            else:
+                results["bands"][band] = {
+                    "success": False,
+                    "message": f"Verification failed: expected {target_channel}, got {actual_channel}"
+                }
+                results["messages"].append(f"{band}: ✗ Verification failed (expected {target_channel}, got {actual_channel})")
                 results["success"] = False
         
-        if not results["success"]:
-            return results
-        
-        # Step 3: Commit UCI changes
-        success, stdout, stderr = run_ssh_command("uci commit wireless", timeout=10)
-        if not success:
+        # Step 3: Apply cfg80211tool for 6G (no wifi load)
+        res_6g = self.apply_6g_with_cfg80211tool()
+        results["bands"]["6G"] = res_6g.get("bands", {}).get("6G", {"success": False, "message": "Unknown"})
+        results["messages"].extend(res_6g.get("messages", []))
+        if not res_6g.get("success", True):
             results["success"] = False
-            results["messages"].append(f"UCI commit failed: {stderr}")
-            return results
         
-        results["messages"].append("UCI changes committed")
+        # Step 4: Get interface status for display
+        success, stdout, stderr = run_ssh_command(
+            "iwconfig 2>/dev/null | grep -E '^ath[0-2]|Channel|Frequency'",
+            timeout=10
+        )
+        if success and stdout.strip():
+            results["interface_status"] = stdout
+            results["messages"].append("Interface status updated")
         
-        # Step 4: Use robust wifi restart sequence (wifi down; wifi up)
-        # This is more reliable than 'wifi load' for channel changes
-        results["messages"].append("Restarting WiFi interfaces (wifi down; wifi up)...")
-        print("[WIFI] Executing 'wifi down; wifi up'...")
-        
-        # Execute wifi down and wifi up in a single command
-        success, stdout, stderr = run_ssh_command("wifi down; sleep 2; wifi up", timeout=90)
-        if not success:
-            # Try running in background if timeout
-            results["messages"].append("Trying wifi restart in background...")
-            restart_cmd = "nohup sh -c 'wifi down; sleep 2; wifi up' > /dev/null 2>&1 &"
-            success, stdout, stderr = run_ssh_command(restart_cmd, timeout=10)
-            if not success:
-                # Last resort: try 'wifi' command
-                results["messages"].append("Trying 'wifi' command...")
-                success, stdout, stderr = run_ssh_command("wifi", timeout=60)
-        
-        results["messages"].append("Wifi restart initiated, waiting for interfaces...")
-        
-        # Step 5: Poll for interfaces to be ready
-        max_wait = 90  # Maximum wait time in seconds
-        start_time = time.time()
-        interfaces_ready = False
-        last_check = ""
-        
-        while time.time() - start_time < max_wait:
-            time.sleep(3)  # Check every 3 seconds (more frequent)
-            elapsed = int(time.time() - start_time)
-            
-            success, stdout, stderr = run_ssh_command("iwconfig 2>/dev/null | grep -E '^ath[0-2]'", timeout=10)
-            
-            if success:
-                found_interfaces = []
-                if "ath0" in stdout:
-                    found_interfaces.append("ath0")
-                if "ath1" in stdout:
-                    found_interfaces.append("ath1")
-                if "ath2" in stdout:
-                    found_interfaces.append("ath2")
-                
-                current_check = ",".join(found_interfaces)
-                if current_check != last_check:
-                    print(f"[WIFI] {elapsed}s: Found interfaces: {current_check}")
-                    last_check = current_check
-                
-                if len(found_interfaces) == 3:
-                    interfaces_ready = True
-                    break
-            
-            # Progress update every 15 seconds
-            if elapsed % 15 == 0 and elapsed > 0:
-                print(f"[WIFI] Waiting... {elapsed}s / {max_wait}s")
-        
-        if interfaces_ready:
-            results["messages"].append("All interfaces ready!")
-            # Wait a bit more for interfaces to stabilize
-            time.sleep(3)
-            
-            success, stdout, stderr = run_ssh_command("iwconfig 2>/dev/null | grep -E 'Frequency|^ath'", timeout=10)
-            if success:
-                results["interface_status"] = stdout
-            
-            # Re-detect interface mapping after wifi restart
-            self.detect_interfaces()
+        if results["success"]:
+            results["messages"].append("✓ All channel configuration completed (no wifi load)")
         else:
-            results["success"] = False
-            results["messages"].append(f"Timeout waiting for interfaces ({max_wait}s). Try rebooting the router.")
+            results["messages"].append("✗ Some channel configurations failed")
         
         return results
     
@@ -945,7 +900,7 @@ class CaptureManager:
     
     def get_current_channel_from_iwconfig(self, interface: str) -> Optional[int]:
         """
-        從 iwconfig 讀取當前頻道
+        從 iwconfig 讀取當前頻道（單次 SSH，在 Python 內解析）。
         
         Args:
             interface: 介面名稱 (如 ath0, ath1, ath2)
@@ -955,38 +910,22 @@ class CaptureManager:
         """
         try:
             success, stdout, stderr = run_ssh_command(
-                f"iwconfig {interface} 2>/dev/null | grep -oP 'Channel:\\K\\d+'",
-                timeout=10
-            )
-            
-            if success and stdout.strip():
-                try:
-                    channel = int(stdout.strip())
-                    return channel
-                except ValueError:
-                    pass
-            
-            # Fallback: 嘗試解析完整 iwconfig 輸出
-            success, stdout, stderr = run_ssh_command(
                 f"iwconfig {interface} 2>/dev/null",
                 timeout=10
             )
-            
-            if success and stdout.strip():
-                # 尋找 "Channel:XX" 或 "Channel XX" 格式
-                import re
-                patterns = [
-                    r'Channel[:\s]+(\d+)',
-                    r'channel[:\s]+(\d+)',
-                ]
-                for pattern in patterns:
-                    match = re.search(pattern, stdout, re.IGNORECASE)
-                    if match:
-                        try:
-                            return int(match.group(1))
-                        except ValueError:
-                            pass
-            
+            if not success or not stdout.strip():
+                return None
+            patterns = [
+                r'Channel[:\s]+(\d+)',
+                r'channel[:\s]+(\d+)',
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, stdout, re.IGNORECASE)
+                if match:
+                    try:
+                        return int(match.group(1))
+                    except ValueError:
+                        pass
             return None
         except Exception as e:
             print(f"[IWCONFIG] Error reading channel for {interface}: {e}")
@@ -1016,95 +955,64 @@ class CaptureManager:
             print(f"[UCI] Error reading 6G channel: {e}")
             return None
     
-    def apply_2g_5g_with_iwconfig(self) -> Dict[str, Any]:
+    def apply_6g_with_cfg80211tool(self) -> Dict[str, Any]:
         """
-        使用 iwconfig 直接設定 2G 和 5G 頻道（無需重啟 WiFi）
+        使用 cfg80211tool 直接設定 6G 頻道（無需 wifi load）。
+        格式：cfg80211tool {6G_interface} channel {channel} 3
+        下完指令後用 iwconfig 檢查，與 2G/5G 流程一致。
         
         Returns:
-            包含成功狀態和訊息的字典
+            包含成功狀態和訊息的字典（僅 6G，不包含 cleanup）
         """
         results = {
             "success": True,
             "messages": [],
             "bands": {},
-            "iwconfig_mode": True,
-            "method": "iwconfig (2G/5G only)"
         }
         
-        # Step 1: Clean up any running tcpdump processes first
-        results["messages"].append("Cleaning up running processes...")
-        print("[IWCONFIG] Cleaning up tcpdump processes...")
-        cleanup_success, cleanup_msg = self.cleanup_remote_processes()
-        if cleanup_success:
-            results["messages"].append("Cleanup completed")
+        iface_6g = self.interfaces.get("6G")
+        if not iface_6g:
+            results["success"] = False
+            results["bands"]["6G"] = {"success": False, "message": "No interface configured for 6G"}
+            results["messages"].append("6G: No interface configured")
+            return results
+        
+        target_channel = self.channel_config["6G"]["channel"]
+        results["messages"].append(f"6G: Setting channel {target_channel} on {iface_6g} (cfg80211tool)...")
+        print(f"[CFG80211] 6G: Setting {iface_6g} to channel {target_channel}")
+        
+        # cfg80211tool ath1 channel 69 3  (channel 可變，最後的 3 固定)
+        cmd = f"cfg80211tool {iface_6g} channel {target_channel} 3"
+        success, stdout, stderr = run_ssh_command(cmd, timeout=10)
+        
+        if not success:
+            results["bands"]["6G"] = {
+                "success": False,
+                "message": f"Failed to set channel: {stderr or stdout}"
+            }
+            results["messages"].append(f"6G: Failed - {stderr or stdout}")
+            results["success"] = False
+            return results
+        
+        time.sleep(2)
+        
+        actual_channel = self.get_current_channel_from_iwconfig(iface_6g)
+        if actual_channel == target_channel:
+            results["bands"]["6G"] = {
+                "success": True,
+                "message": f"Channel set to {target_channel} (verified)"
+            }
+            results["messages"].append(f"6G: ✓ Channel {target_channel} set successfully")
+            print(f"[CFG80211] 6G: Verified channel {target_channel} on {iface_6g}")
         else:
-            results["messages"].append(f"Cleanup warning: {cleanup_msg}")
-        
-        # Step 2: Apply iwconfig for 2G and 5G
-        for band in ["2G", "5G"]:
-            interface = self.interfaces.get(band)
-            if not interface:
-                results["bands"][band] = {
-                    "success": False,
-                    "message": f"No interface configured for {band}"
-                }
-                results["messages"].append(f"{band}: No interface configured")
-                results["success"] = False
-                continue
-            
-            target_channel = self.channel_config[band]["channel"]
-            results["messages"].append(f"{band}: Setting channel {target_channel} on {interface}...")
-            print(f"[IWCONFIG] {band}: Setting {interface} to channel {target_channel}")
-            
-            # Execute iwconfig command
-            iwconfig_cmd = f"iwconfig {interface} Channel {target_channel}"
-            success, stdout, stderr = run_ssh_command(iwconfig_cmd, timeout=10)
-            
-            if not success:
-                results["bands"][band] = {
-                    "success": False,
-                    "message": f"Failed to set channel: {stderr or stdout}"
-                }
-                results["messages"].append(f"{band}: Failed - {stderr or stdout}")
-                results["success"] = False
-                continue
-            
-            # Wait for setting to take effect
-            time.sleep(2)
-            
-            # Step 3: Verify channel was set correctly
-            actual_channel = self.get_current_channel_from_iwconfig(interface)
-            if actual_channel == target_channel:
-                results["bands"][band] = {
-                    "success": True,
-                    "message": f"Channel set to {target_channel} (verified)"
-                }
-                results["messages"].append(f"{band}: ✓ Channel {target_channel} set successfully")
-                print(f"[IWCONFIG] {band}: Verified channel {target_channel} on {interface}")
-            else:
-                results["bands"][band] = {
-                    "success": False,
-                    "message": f"Channel verification failed: expected {target_channel}, got {actual_channel}"
-                }
-                results["messages"].append(
-                    f"{band}: ✗ Verification failed (expected {target_channel}, got {actual_channel})"
-                )
-                results["success"] = False
-                print(f"[IWCONFIG] {band}: Verification failed - expected {target_channel}, got {actual_channel}")
-        
-        # Step 4: Get interface status for display
-        success, stdout, stderr = run_ssh_command(
-            "iwconfig 2>/dev/null | grep -E '^ath[0-2]|Channel|Frequency'",
-            timeout=10
-        )
-        if success and stdout.strip():
-            results["interface_status"] = stdout
-            results["messages"].append("Interface status updated")
-        
-        if results["success"]:
-            results["messages"].append("✓ 2G/5G channel configuration completed (iwconfig mode)")
-        else:
-            results["messages"].append("✗ Some channel configurations failed")
+            results["bands"]["6G"] = {
+                "success": False,
+                "message": f"Channel verification failed: expected {target_channel}, got {actual_channel}"
+            }
+            results["messages"].append(
+                f"6G: ✗ Verification failed (expected {target_channel}, got {actual_channel})"
+            )
+            results["success"] = False
         
         return results
 

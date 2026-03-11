@@ -217,12 +217,7 @@ function updateInterfaceDisplay(interfaces, detectionStatus) {
 
     if (badge && detectionStatus) {
         badge.textContent = detectionStatus.detected ? '✓ Auto-detected' : 'Default';
-        badge.style.background = detectionStatus.detected 
-            ? 'rgba(34, 197, 94, 0.2)' 
-            : 'rgba(148, 163, 184, 0.2)';
-        badge.style.color = detectionStatus.detected 
-            ? 'var(--accent-2g)' 
-            : 'var(--text-secondary)';
+        badge.classList.toggle('detection-badge--detected', detectionStatus.detected);
     }
 
     // Update card interface labels
@@ -392,6 +387,22 @@ async function stopAll() {
     setLoading(false);
 }
 
+// ============== Stop All Confirmation ==============
+function confirmStopAllPrompt() {
+    const modal = document.getElementById('stopAllModal');
+    if (modal) modal.style.display = 'flex';
+}
+
+function closeStopAllModal() {
+    const modal = document.getElementById('stopAllModal');
+    if (modal) modal.style.display = 'none';
+}
+
+async function confirmStopAll() {
+    closeStopAllModal();
+    await stopAll();
+}
+
 // ============== Configuration ==============
 async function applyConfig(band) {
     const channel = document.getElementById('channel-' + band.toLowerCase()).value;
@@ -413,17 +424,17 @@ async function applyConfig(band) {
 }
 
 async function applyAllConfig() {
-    // Update all band configs from dropdowns
-    for (const band of ['2G', '5G', '6G']) {
+    // Update all band configs from dropdowns (parallel)
+    const configPromises = ['2G', '5G', '6G'].map(band => {
         const channel = document.getElementById('channel-' + band.toLowerCase()).value;
         const bandwidth = document.getElementById('bandwidth-' + band.toLowerCase()).value;
-
-        await fetch('/api/config/' + band, {
+        return fetch('/api/config/' + band, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ channel: channel, bandwidth: bandwidth })
         });
-    }
+    });
+    await Promise.all(configPromises);
 
     // Show modal
     const modal = document.getElementById('configModal');
@@ -458,7 +469,7 @@ async function applyAllConfig() {
 
         if (data.interface_status) {
             status.innerHTML += '<div class="config-line success">Interface Status:</div>';
-            status.innerHTML += `<pre style="font-size: 0.75rem; color: var(--text-secondary); margin: 0.5rem 0;">${data.interface_status}</pre>`;
+            status.innerHTML += `<pre class="config-interface-status">${data.interface_status}</pre>`;
         }
 
         spinner.style.display = 'none';
@@ -503,19 +514,17 @@ async function updateTimeDisplay() {
 
         if (badge && data.offset_seconds !== null) {
             const absOffset = Math.abs(data.offset_seconds);
+            badge.classList.remove('time-badge--synced', 'time-badge--warning', 'time-badge--error');
             if (absOffset < 2) {
                 badge.textContent = '✓ Synced';
-                badge.style.background = 'rgba(34, 197, 94, 0.2)';
-                badge.style.color = 'var(--accent-2g)';
+                badge.classList.add('time-badge--synced');
             } else if (absOffset < 60) {
                 badge.textContent = `${data.offset_seconds > 0 ? '+' : ''}${data.offset_seconds.toFixed(0)}s`;
-                badge.style.background = 'rgba(245, 158, 11, 0.2)';
-                badge.style.color = 'var(--accent-warning)';
+                badge.classList.add('time-badge--warning');
             } else {
                 const minutes = Math.round(absOffset / 60);
                 badge.textContent = `${data.offset_seconds > 0 ? '+' : '-'}${minutes}m`;
-                badge.style.background = 'rgba(239, 68, 68, 0.2)';
-                badge.style.color = 'var(--accent-danger)';
+                badge.classList.add('time-badge--error');
             }
         }
     } catch (e) {
@@ -598,11 +607,11 @@ function updateFileSplitUI(enabled, size_mb) {
 
     if (statusDiv) {
         if (enabled) {
-            statusDiv.innerHTML = `✂️ Split enabled: <strong>${size_mb} MB</strong> per file`;
-            statusDiv.style.color = 'var(--accent-2g)';
+            statusDiv.innerHTML = `Split enabled: <strong>${size_mb} MB</strong> per file`;
+            statusDiv.className = 'file-split-status file-split-status--active';
         } else {
-            statusDiv.innerHTML = '📁 Continuous capture (no split)';
-            statusDiv.style.color = 'var(--text-secondary)';
+            statusDiv.textContent = 'Continuous capture (no split)';
+            statusDiv.className = 'file-split-status';
         }
     }
 
@@ -624,7 +633,7 @@ async function loadCurrentWifiConfig() {
             // Use the common update function
             updateChannelConfigUI(data.config);
 
-            showNotification('Loaded current WiFi configuration from OpenWrt', 'success');
+            showNotification('Loaded current WiFi configuration from OpenWrt (UCI; runtime channel may differ after Apply Config)', 'success');
         }
     } catch (e) {
         console.error('[CONFIG] Load error:', e);
@@ -642,7 +651,7 @@ async function refreshWifiConfig() {
 
         if (data.success && data.config) {
             updateChannelConfigUI(data.config);
-            showNotification('WiFi configuration refreshed from OpenWrt', 'success');
+            showNotification('WiFi configuration refreshed from OpenWrt (UCI; runtime channel may differ after Apply Config)', 'success');
         } else {
             showNotification('Failed to refresh WiFi config', 'error');
         }
@@ -659,24 +668,45 @@ async function diagnoseConnection() {
         const response = await fetch('/api/diagnose');
         const data = await response.json();
 
-        let statusHtml = `
-            <div style="background: var(--bg-dark); border-radius: 0.5rem; padding: 1rem; margin-bottom: 1rem; font-family: 'JetBrains Mono', monospace; font-size: 0.9rem;">
-                <div style="margin-bottom: 0.5rem;"><strong>Host:</strong> ${data.host}:${data.port}</div>
-                <div style="margin-bottom: 0.5rem;"><strong>User:</strong> ${data.user}</div>
-                <div style="margin-bottom: 0.5rem;"><strong>Password Set:</strong> ${data.password_set ? '<span style="color: var(--accent-2g);">Yes</span>' : '<span style="color: var(--accent-danger);">No</span>'}</div>
-                <div style="margin-bottom: 0.5rem;"><strong>SSH Keys Found:</strong> ${data.ssh_keys_found && data.ssh_keys_found.length > 0 ? '<span style="color: var(--accent-2g);">' + data.ssh_keys_found.join(', ') + '</span>' : '<span style="color: var(--text-secondary);">None</span>'}</div>
-                <div style="margin-bottom: 0.5rem;"><strong>Ping Test:</strong> ${data.ping_test ? '<span style="color: var(--accent-2g);">✓ OK</span>' : '<span style="color: var(--accent-danger);">✗ Failed</span>'}</div>
-                <div><strong>SSH Test:</strong> ${data.ssh_test ? '<span style="color: var(--accent-2g);">✓ OK</span>' : '<span style="color: var(--accent-danger);">✗ Failed</span>'}</div>
-                ${data.error ? `<div style="margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--border-color); color: var(--accent-danger);"><strong>Error:</strong> ${data.error}</div>` : ''}
+        const pwStatus = data.password_set
+            ? '<span class="diagnose-value--ok">Yes</span>'
+            : '<span class="diagnose-value--fail">No</span>';
+        const keysStatus = data.ssh_keys_found && data.ssh_keys_found.length > 0
+            ? `<span class="diagnose-value--ok">${data.ssh_keys_found.join(', ')}</span>`
+            : '<span class="diagnose-value--neutral">None</span>';
+        const pingStatus = data.ping_test
+            ? '<span class="diagnose-value--ok">✓ OK</span>'
+            : '<span class="diagnose-value--fail">✗ Failed</span>';
+        const sshStatus = data.ssh_test
+            ? '<span class="diagnose-value--ok">✓ OK</span>'
+            : '<span class="diagnose-value--fail">✗ Failed</span>';
+        const errorBlock = data.error
+            ? `<div class="diagnose-error-block"><strong>Error:</strong> ${data.error}</div>`
+            : '';
+
+        const statusHtml = `
+            <div class="diagnose-info-block">
+                <div class="diagnose-info-row"><strong>Host:</strong> ${data.host}:${data.port}</div>
+                <div class="diagnose-info-row"><strong>User:</strong> ${data.user}</div>
+                <div class="diagnose-info-row"><strong>Password Set:</strong> ${pwStatus}</div>
+                <div class="diagnose-info-row"><strong>SSH Keys Found:</strong> ${keysStatus}</div>
+                <div class="diagnose-info-row"><strong>Ping Test:</strong> ${pingStatus}</div>
+                <div class="diagnose-info-row"><strong>SSH Test:</strong> ${sshStatus}</div>
+                ${errorBlock}
             </div>
         `;
 
         let solutionHtml = '';
         if (!data.ssh_test && data.solution_text) {
             solutionHtml = `
-                <div style="background: rgba(234, 179, 8, 0.1); border: 1px solid #eab308; border-radius: 0.5rem; padding: 1rem;">
-                    <div style="font-weight: 600; color: #eab308; margin-bottom: 0.5rem;">💡 Solution</div>
-                    <div style="color: var(--text-secondary); font-size: 0.9rem;">${data.solution_text}</div>
+                <div class="diagnose-solution-block">
+                    <div class="diagnose-solution-title">
+                        <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"/>
+                        </svg>
+                        Solution
+                    </div>
+                    <div class="diagnose-solution-text">${data.solution_text}</div>
                 </div>
             `;
         }
@@ -694,17 +724,25 @@ function showDiagnoseModal(statusHtml, solutionHtml, isConnected) {
 
     const modal = document.createElement('div');
     modal.id = 'diagnoseModal';
-    modal.style.cssText = 'position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); display: flex; justify-content: center; align-items: center; z-index: 9999;';
+    modal.className = 'diagnose-modal-overlay';
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+    modal.setAttribute('aria-label', 'Connection Diagnosis');
     modal.innerHTML = `
-        <div style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 1rem; padding: 1.5rem; max-width: 500px; width: 90%; max-height: 90vh; overflow-y: auto;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                <h3 style="margin: 0; font-size: 1.25rem;">🔍 Connection Diagnosis</h3>
-                <button onclick="closeDiagnoseModal()" style="background: none; border: none; color: var(--text-secondary); font-size: 1.5rem; cursor: pointer; padding: 0; line-height: 1;">&times;</button>
+        <div class="diagnose-modal-content">
+            <div class="diagnose-modal-header">
+                <h3 class="diagnose-modal-title">
+                    <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+                    </svg>
+                    Connection Diagnosis
+                </h3>
+                <button onclick="closeDiagnoseModal()" class="diagnose-modal-close" aria-label="Close">&times;</button>
             </div>
             ${statusHtml}
             ${solutionHtml}
-            <div style="display: flex; gap: 0.75rem; justify-content: flex-end; margin-top: 1rem;">
-                <button onclick="closeDiagnoseModal()" style="padding: 0.75rem 1.5rem; background: var(--bg-dark); border: 1px solid var(--border-color); border-radius: 0.5rem; color: var(--text-primary); cursor: pointer;">OK</button>
+            <div class="diagnose-modal-footer">
+                <button onclick="closeDiagnoseModal()" class="btn btn-refresh">OK</button>
             </div>
         </div>
     `;
@@ -720,16 +758,29 @@ function closeDiagnoseModal() {
 function showNotification(message, type = 'success') {
     const notif = document.getElementById('notification');
     const text = document.getElementById('notificationText');
-    
+    const progress = document.getElementById('notificationProgress');
+
     if (notif && text) {
         notif.className = 'notification ' + type;
         text.textContent = message;
-        notif.style.display = 'flex';
+        notif.style.display = 'block';
 
-        setTimeout(() => {
-            notif.style.display = 'none';
-        }, 4000);
+        // Restart progress bar animation
+        if (progress) {
+            progress.style.animation = 'none';
+            void progress.offsetHeight; // force reflow
+            progress.style.animation = '';
+        }
+
+        clearTimeout(window._notifTimer);
+        window._notifTimer = setTimeout(dismissNotification, 5000);
     }
+}
+
+function dismissNotification() {
+    const notif = document.getElementById('notification');
+    if (notif) notif.style.display = 'none';
+    clearTimeout(window._notifTimer);
 }
 
 function setLoading(show) {
@@ -777,6 +828,9 @@ window.startCapture = startCapture;
 window.stopCapture = stopCapture;
 window.startAll = startAll;
 window.stopAll = stopAll;
+window.confirmStopAllPrompt = confirmStopAllPrompt;
+window.closeStopAllModal = closeStopAllModal;
+window.confirmStopAll = confirmStopAll;
 window.applyConfig = applyConfig;
 window.applyAllConfig = applyAllConfig;
 window.closeConfigModal = closeConfigModal;
@@ -788,3 +842,4 @@ window.diagnoseConnection = diagnoseConnection;
 window.closeDiagnoseModal = closeDiagnoseModal;
 window.loadCurrentWifiConfig = loadCurrentWifiConfig;
 window.refreshWifiConfig = refreshWifiConfig;
+window.dismissNotification = dismissNotification;

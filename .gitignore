@@ -15,3 +15,9 @@ build/output/
 # Virtual environment
 venv/
 .env/
+
+# Debug session logs
+debug_session/
+
+# Test files
+tests/

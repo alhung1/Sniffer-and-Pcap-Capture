@@ -1,6 +1,6 @@
 /**
- * WiFi Sniffer Web Control Panel - JavaScript
- * ============================================
+ * WiFi Sniffer Web Control Panel v3 – JavaScript
+ * ================================================
  * Handles UI interactions and WebSocket communication.
  */
 
@@ -11,11 +11,12 @@ const STATUS_UPDATE_INTERVAL = 5000;
 // ============== State ==============
 let socket = null;
 let isConnected = false;
-let connectionCheckInterval = null;
+let _pollingStatusTimer = null;
+let _pollingTimeTimer = null;
+let _routerHost = null; // populated from API
 
 // ============== WebSocket ==============
 function initWebSocket() {
-    // Check if Socket.IO is available
     if (typeof io === 'undefined') {
         console.log('[WS] Socket.IO not available, falling back to polling');
         startPolling();
@@ -43,7 +44,7 @@ function initWebSocket() {
     });
 
     socket.on('connection_update', (data) => {
-        updateConnectionDisplay(data.connected);
+        updateConnectionDisplay(data.connected, data.host);
         if (data.interfaces) {
             updateInterfaceDisplay(data.interfaces, data.detection_status);
         }
@@ -57,8 +58,10 @@ function initWebSocket() {
 
 // ============== Polling Fallback ==============
 function startPolling() {
-    // Status polling
-    setInterval(async () => {
+    // Prevent stacking: clear any existing timers first
+    if (_pollingStatusTimer) clearInterval(_pollingStatusTimer);
+
+    _pollingStatusTimer = setInterval(async () => {
         try {
             const response = await fetch('/api/status');
             const data = await response.json();
@@ -68,7 +71,6 @@ function startPolling() {
         }
     }, STATUS_UPDATE_INTERVAL);
 
-    // Connection check on page load
     checkConnection();
 }
 
@@ -77,24 +79,20 @@ async function checkConnection() {
     const dot = document.getElementById('connectionDot');
     const text = document.getElementById('connectionText');
 
-    if (dot) {
-        dot.className = 'status-dot checking';
-    }
-    if (text) {
-        text.textContent = 'Checking connection...';
-    }
+    if (dot) dot.className = 'status-dot checking';
+    if (text) text.textContent = 'Checking connection...';
 
     try {
         const response = await fetch('/api/test_connection');
         const data = await response.json();
-        
-        updateConnectionDisplay(data.connected);
-        
-        if (data.connected) {
-            // Auto-detect interfaces if connected
-            if (!window.interfacesDetected) {
-                detectInterfaces();
-            }
+
+        // Store the host from the API so we never hard-code it
+        if (data.host) _routerHost = data.host;
+
+        updateConnectionDisplay(data.connected, data.host);
+
+        if (data.connected && !window.interfacesDetected) {
+            detectInterfaces();
         }
     } catch (e) {
         console.error('[Connection] Check failed:', e);
@@ -102,19 +100,19 @@ async function checkConnection() {
     }
 }
 
-function updateConnectionDisplay(connected) {
+function updateConnectionDisplay(connected, host) {
     const dot = document.getElementById('connectionDot');
     const text = document.getElementById('connectionText');
+    const displayHost = host || _routerHost || 'Router';
 
     if (dot) {
         dot.className = 'status-dot ' + (connected ? 'connected' : 'disconnected');
     }
     if (text) {
-        text.textContent = connected 
-            ? '192.168.1.1 Connected' 
-            : '192.168.1.1 Disconnected - Click to diagnose';
+        text.textContent = connected
+            ? displayHost + ' Connected'
+            : displayHost + ' Disconnected - Click to diagnose';
     }
-
     isConnected = connected;
 }
 
@@ -123,14 +121,12 @@ async function detectInterfaces() {
     try {
         const response = await fetch('/api/interface_mapping');
         const data = await response.json();
-        
+
         if (data.interfaces) {
             updateInterfaceDisplay(data.interfaces, data.detection_status);
             window.interfacesDetected = true;
-            
-            // Also update channel config if available
+
             if (data.channel_config) {
-                console.log('[Interfaces] Channel config from mapping:', data.channel_config);
                 updateChannelConfigUI(data.channel_config);
             }
         }
@@ -140,9 +136,6 @@ async function detectInterfaces() {
 }
 
 function updateChannelConfigUI(config) {
-    /**
-     * Update the channel and bandwidth dropdowns with the actual OpenWrt config
-     */
     for (const [band, cfg] of Object.entries(config)) {
         const bandLower = band.toLowerCase();
         const channelSelect = document.getElementById('channel-' + bandLower);
@@ -152,8 +145,6 @@ function updateChannelConfigUI(config) {
         if (channelSelect && cfg.channel) {
             const channelValue = String(cfg.channel);
             let found = false;
-            
-            // Try to find and select the channel
             for (let option of channelSelect.options) {
                 if (option.value === channelValue) {
                     channelSelect.value = channelValue;
@@ -161,22 +152,18 @@ function updateChannelConfigUI(config) {
                     break;
                 }
             }
-            
-            // If channel not in dropdown, add it
             if (!found) {
-                const newOption = document.createElement('option');
-                newOption.value = channelValue;
-                newOption.textContent = 'CH ' + channelValue;
-                channelSelect.appendChild(newOption);
+                const opt = document.createElement('option');
+                opt.value = channelValue;
+                opt.textContent = 'CH ' + channelValue;
+                channelSelect.appendChild(opt);
                 channelSelect.value = channelValue;
-                console.log(`[Config] Added missing channel ${channelValue} for ${band}`);
             }
         }
 
         if (bandwidthSelect && cfg.bandwidth) {
             const bwValue = cfg.bandwidth;
             let found = false;
-            
             for (let option of bandwidthSelect.options) {
                 if (option.value === bwValue) {
                     bandwidthSelect.value = bwValue;
@@ -184,25 +171,19 @@ function updateChannelConfigUI(config) {
                     break;
                 }
             }
-            
-            // If bandwidth not in dropdown, add it
             if (!found) {
-                const newOption = document.createElement('option');
-                newOption.value = bwValue;
-                newOption.textContent = bwValue;
-                bandwidthSelect.appendChild(newOption);
+                const opt = document.createElement('option');
+                opt.value = bwValue;
+                opt.textContent = bwValue;
+                bandwidthSelect.appendChild(opt);
                 bandwidthSelect.value = bwValue;
-                console.log(`[Config] Added missing bandwidth ${bwValue} for ${band}`);
             }
         }
-        
-        // Update the current channel display label if exists
+
         if (channelLabel) {
-            channelLabel.textContent = `CH ${cfg.channel}`;
+            channelLabel.textContent = 'CH ' + cfg.channel;
         }
     }
-    
-    console.log('[Config] UI updated with current config');
 }
 
 function updateInterfaceDisplay(interfaces, detectionStatus) {
@@ -211,21 +192,15 @@ function updateInterfaceDisplay(interfaces, detectionStatus) {
     const mapping6G = document.getElementById('mapping6G');
     const badge = document.getElementById('detectionBadge');
 
-    if (mapping2G) mapping2G.textContent = `2G=${interfaces['2G']}`;
-    if (mapping5G) mapping5G.textContent = `5G=${interfaces['5G']}`;
-    if (mapping6G) mapping6G.textContent = `6G=${interfaces['6G']}`;
+    if (mapping2G) mapping2G.textContent = '2G=' + interfaces['2G'];
+    if (mapping5G) mapping5G.textContent = '5G=' + interfaces['5G'];
+    if (mapping6G) mapping6G.textContent = '6G=' + interfaces['6G'];
 
     if (badge && detectionStatus) {
-        badge.textContent = detectionStatus.detected ? '✓ Auto-detected' : 'Default';
-        badge.style.background = detectionStatus.detected 
-            ? 'rgba(34, 197, 94, 0.2)' 
-            : 'rgba(148, 163, 184, 0.2)';
-        badge.style.color = detectionStatus.detected 
-            ? 'var(--accent-2g)' 
-            : 'var(--text-secondary)';
+        badge.textContent = detectionStatus.detected ? '\u2713 Auto-detected' : 'Default';
+        badge.classList.toggle('detection-badge--detected', detectionStatus.detected);
     }
 
-    // Update card interface labels
     const iface2g = document.getElementById('iface-2g');
     const iface5g = document.getElementById('iface-5g');
     const iface6g = document.getElementById('iface-6g');
@@ -265,22 +240,17 @@ function updateStatusDisplay(data) {
             statusEl.textContent = info.running ? 'CAPTURING' : 'IDLE';
             statusEl.className = 'status-badge ' + (info.running ? 'status-running' : 'status-idle');
         }
-        if (durationEl) {
-            durationEl.textContent = info.duration || '--:--';
-        }
-        if (packetsEl) {
-            packetsEl.textContent = info.packets || 0;
-        }
+        if (durationEl) durationEl.textContent = info.duration || '--:--';
+        if (packetsEl) packetsEl.textContent = info.packets || 0;
 
-        // Update button states
         updateCaptureButtons(band, info.running);
     }
 }
 
 function updateCaptureButtons(band, running) {
     const bandLower = band.toLowerCase();
-    const startBtn = document.querySelector(`.card-${bandLower} .btn-start`);
-    const stopBtn = document.querySelector(`.card-${bandLower} .btn-stop`);
+    const startBtn = document.querySelector('.card-' + bandLower + ' .btn-start');
+    const stopBtn = document.querySelector('.card-' + bandLower + ' .btn-stop');
 
     if (startBtn) {
         startBtn.disabled = running;
@@ -299,9 +269,7 @@ async function startCapture(band) {
         const response = await fetch('/api/start/' + band, { method: 'POST' });
         const data = await response.json();
         showNotification(data.message, data.success ? 'success' : 'error');
-        if (data.success) {
-            setTimeout(refreshStatus, 500);
-        }
+        if (data.success) setTimeout(refreshStatus, 500);
     } catch (e) {
         showNotification('Error: ' + e.message, 'error');
     }
@@ -314,9 +282,7 @@ async function stopCapture(band) {
         const response = await fetch('/api/stop/' + band, { method: 'POST' });
         const data = await response.json();
         showNotification(data.message, data.success ? 'success' : 'error');
-        if (data.success) {
-            setTimeout(refreshStatus, 500);
-        }
+        if (data.success) setTimeout(refreshStatus, 500);
     } catch (e) {
         showNotification('Error: ' + e.message, 'error');
     }
@@ -344,20 +310,19 @@ async function stopAll() {
         let savedBands = [];
         let noFileBands = [];
         let errorBands = [];
-        
+
         const resultEntries = Object.entries(data.results);
-        
-        // Check if SSH failed for all bands
-        const allSshFailed = resultEntries.every(([band, r]) => 
+
+        const allSshFailed = resultEntries.every(([, r]) =>
             r.message && r.message.includes('SSH error'));
-        
+
         if (allSshFailed && resultEntries.length > 0) {
             showNotification('SSH connection to router failed. Check connection.', 'error');
             setTimeout(refreshStatus, 500);
             setLoading(false);
             return;
         }
-        
+
         for (const [band, result] of resultEntries) {
             if (result.success && result.path) {
                 savedBands.push(band);
@@ -367,16 +332,12 @@ async function stopAll() {
                 errorBands.push(band);
             }
         }
-        
+
         if (savedBands.length > 0) {
-            // At least some files downloaded
             let msg = 'Downloaded: ' + savedBands.join(', ');
-            if (noFileBands.length > 0) {
-                msg += ' | No files: ' + noFileBands.join(', ');
-            }
+            if (noFileBands.length > 0) msg += ' | No files: ' + noFileBands.join(', ');
             showNotification(msg, 'success');
         } else if (noFileBands.length === 3) {
-            // All 3 bands checked but no files found
             showNotification('No capture files on router (captures may not have been started)', 'warning');
         } else if (noFileBands.length > 0) {
             showNotification('No capture files found on router', 'warning');
@@ -390,6 +351,22 @@ async function stopAll() {
         showNotification('Error: ' + e.message, 'error');
     }
     setLoading(false);
+}
+
+// ============== Stop All Confirmation ==============
+function confirmStopAllPrompt() {
+    const modal = document.getElementById('stopAllModal');
+    if (modal) modal.style.display = 'flex';
+}
+
+function closeStopAllModal() {
+    const modal = document.getElementById('stopAllModal');
+    if (modal) modal.style.display = 'none';
+}
+
+async function confirmStopAll() {
+    closeStopAllModal();
+    await stopAll();
 }
 
 // ============== Configuration ==============
@@ -413,7 +390,6 @@ async function applyConfig(band) {
 }
 
 async function applyAllConfig() {
-    // Update all band configs from dropdowns (parallel)
     const configPromises = ['2G', '5G', '6G'].map(band => {
         const channel = document.getElementById('channel-' + band.toLowerCase()).value;
         const bandwidth = document.getElementById('bandwidth-' + band.toLowerCase()).value;
@@ -425,7 +401,6 @@ async function applyAllConfig() {
     });
     await Promise.all(configPromises);
 
-    // Show modal
     const modal = document.getElementById('configModal');
     const status = document.getElementById('configStatus');
     const spinner = document.getElementById('configSpinner');
@@ -440,7 +415,7 @@ async function applyAllConfig() {
         for (const band of ['2G', '5G', '6G']) {
             const ch = document.getElementById('channel-' + band.toLowerCase()).value;
             const bw = document.getElementById('bandwidth-' + band.toLowerCase()).value;
-            status.innerHTML += `<div class="config-line">${band}: CH ${ch}, ${bw}</div>`;
+            status.innerHTML += '<div class="config-line">' + band + ': CH ' + ch + ', ' + bw + '</div>';
         }
 
         status.innerHTML += '<div class="config-line info">Sending to OpenWrt...</div>';
@@ -452,26 +427,25 @@ async function applyAllConfig() {
             for (const msg of data.messages) {
                 const cssClass = msg.includes('failed') || msg.includes('Failed') ? 'error' :
                     msg.includes('ready') || msg.includes('success') || msg.includes('Saved') ? 'success' : 'info';
-                status.innerHTML += `<div class="config-line ${cssClass}">${msg}</div>`;
+                status.innerHTML += '<div class="config-line ' + cssClass + '">' + msg + '</div>';
             }
         }
 
         if (data.interface_status) {
             status.innerHTML += '<div class="config-line success">Interface Status:</div>';
-            status.innerHTML += `<pre style="font-size: 0.75rem; color: var(--text-secondary); margin: 0.5rem 0;">${data.interface_status}</pre>`;
+            status.innerHTML += '<pre class="config-interface-status">' + data.interface_status + '</pre>';
         }
 
         spinner.style.display = 'none';
         complete.style.display = 'block';
 
         if (data.success) {
-            status.innerHTML += '<div class="config-line success">✓ All configurations applied successfully!</div>';
+            status.innerHTML += '<div class="config-line success">All configurations applied successfully!</div>';
         } else {
-            status.innerHTML += '<div class="config-line error">✗ Configuration failed. Check messages above.</div>';
+            status.innerHTML += '<div class="config-line error">Configuration failed. Check messages above.</div>';
         }
-
     } catch (e) {
-        status.innerHTML += `<div class="config-line error">Error: ${e.message}</div>`;
+        status.innerHTML += '<div class="config-line error">Error: ' + e.message + '</div>';
         spinner.style.display = 'none';
         complete.style.display = 'block';
     }
@@ -494,28 +468,22 @@ async function updateTimeDisplay() {
         const openwrtTime = document.getElementById('openwrtTime');
         const badge = document.getElementById('timeOffsetBadge');
 
-        if (pcTime) {
-            pcTime.textContent = data.pc_time ? data.pc_time.split(' ')[1] : '--:--:--';
-        }
-        if (openwrtTime) {
-            openwrtTime.textContent = data.openwrt_time ? data.openwrt_time.split(' ')[1] : '--:--:--';
-        }
+        if (pcTime) pcTime.textContent = data.pc_time ? data.pc_time.split(' ')[1] : '--:--:--';
+        if (openwrtTime) openwrtTime.textContent = data.openwrt_time ? data.openwrt_time.split(' ')[1] : '--:--:--';
 
         if (badge && data.offset_seconds !== null) {
             const absOffset = Math.abs(data.offset_seconds);
+            badge.classList.remove('time-badge--synced', 'time-badge--warning', 'time-badge--error');
             if (absOffset < 2) {
-                badge.textContent = '✓ Synced';
-                badge.style.background = 'rgba(34, 197, 94, 0.2)';
-                badge.style.color = 'var(--accent-2g)';
+                badge.textContent = '\u2713 Synced';
+                badge.classList.add('time-badge--synced');
             } else if (absOffset < 60) {
-                badge.textContent = `${data.offset_seconds > 0 ? '+' : ''}${data.offset_seconds.toFixed(0)}s`;
-                badge.style.background = 'rgba(245, 158, 11, 0.2)';
-                badge.style.color = 'var(--accent-warning)';
+                badge.textContent = (data.offset_seconds > 0 ? '+' : '') + data.offset_seconds.toFixed(0) + 's';
+                badge.classList.add('time-badge--warning');
             } else {
                 const minutes = Math.round(absOffset / 60);
-                badge.textContent = `${data.offset_seconds > 0 ? '+' : '-'}${minutes}m`;
-                badge.style.background = 'rgba(239, 68, 68, 0.2)';
-                badge.style.color = 'var(--accent-danger)';
+                badge.textContent = (data.offset_seconds > 0 ? '+' : '-') + minutes + 'm';
+                badge.classList.add('time-badge--error');
             }
         }
     } catch (e) {
@@ -528,7 +496,6 @@ async function manualSyncTime() {
     try {
         const response = await fetch('/api/sync_time', { method: 'POST' });
         const data = await response.json();
-
         if (data.success) {
             showNotification('Time synchronized successfully!', 'success');
             updateTimeDisplay();
@@ -549,9 +516,6 @@ async function loadFileSplitSettings() {
 
         const checkbox = document.getElementById('fileSplitEnabled');
         const sizeSelect = document.getElementById('fileSplitSize');
-        const sizeContainer = document.getElementById('fileSplitSizeContainer');
-        const statusDiv = document.getElementById('fileSplitStatus');
-        const splitNote = document.getElementById('splitFileNote');
 
         if (checkbox) checkbox.checked = data.enabled;
         if (sizeSelect) sizeSelect.value = data.size_mb;
@@ -578,10 +542,7 @@ async function updateFileSplit() {
             body: JSON.stringify({ enabled: enabled, size_mb: size_mb })
         });
         const data = await response.json();
-
-        if (data.success) {
-            showNotification(data.message, 'success');
-        }
+        if (data.success) showNotification(data.message, 'success');
     } catch (e) {
         showNotification('Failed to update file split settings: ' + e.message, 'error');
     }
@@ -592,23 +553,19 @@ function updateFileSplitUI(enabled, size_mb) {
     const statusDiv = document.getElementById('fileSplitStatus');
     const splitNote = document.getElementById('splitFileNote');
 
-    if (sizeContainer) {
-        sizeContainer.style.opacity = enabled ? '1' : '0.5';
-    }
+    if (sizeContainer) sizeContainer.style.opacity = enabled ? '1' : '0.5';
 
     if (statusDiv) {
         if (enabled) {
-            statusDiv.innerHTML = `✂️ Split enabled: <strong>${size_mb} MB</strong> per file`;
-            statusDiv.style.color = 'var(--accent-2g)';
+            statusDiv.innerHTML = 'Split enabled: <strong>' + size_mb + ' MB</strong> per file';
+            statusDiv.className = 'file-split-status file-split-status--active';
         } else {
-            statusDiv.innerHTML = '📁 Continuous capture (no split)';
-            statusDiv.style.color = 'var(--text-secondary)';
+            statusDiv.textContent = 'Continuous capture (no split)';
+            statusDiv.className = 'file-split-status';
         }
     }
 
-    if (splitNote) {
-        splitNote.style.display = enabled ? 'block' : 'none';
-    }
+    if (splitNote) splitNote.style.display = enabled ? 'block' : 'none';
 }
 
 // ============== WiFi Config ==============
@@ -616,14 +573,8 @@ async function loadCurrentWifiConfig() {
     try {
         const response = await fetch('/api/get_wifi_config');
         const data = await response.json();
-
         if (data.success && data.config) {
-            console.log('[CONFIG] Loaded WiFi config from OpenWrt:', data.config);
-            console.log('[CONFIG] UCI WiFi Map:', data.uci_wifi_map);
-            
-            // Use the common update function
             updateChannelConfigUI(data.config);
-
             showNotification('Loaded current WiFi configuration from OpenWrt (UCI; runtime channel may differ after Apply Config)', 'success');
         }
     } catch (e) {
@@ -632,14 +583,10 @@ async function loadCurrentWifiConfig() {
 }
 
 async function refreshWifiConfig() {
-    /**
-     * Force refresh WiFi config from OpenWrt
-     */
     setLoading(true);
     try {
         const response = await fetch('/api/get_wifi_config');
         const data = await response.json();
-
         if (data.success && data.config) {
             updateChannelConfigUI(data.config);
             showNotification('WiFi configuration refreshed from OpenWrt (UCI; runtime channel may differ after Apply Config)', 'success');
@@ -659,26 +606,38 @@ async function diagnoseConnection() {
         const response = await fetch('/api/diagnose');
         const data = await response.json();
 
-        let statusHtml = `
-            <div style="background: var(--bg-dark); border-radius: 0.5rem; padding: 1rem; margin-bottom: 1rem; font-family: 'JetBrains Mono', monospace; font-size: 0.9rem;">
-                <div style="margin-bottom: 0.5rem;"><strong>Host:</strong> ${data.host}:${data.port}</div>
-                <div style="margin-bottom: 0.5rem;"><strong>User:</strong> ${data.user}</div>
-                <div style="margin-bottom: 0.5rem;"><strong>Password Set:</strong> ${data.password_set ? '<span style="color: var(--accent-2g);">Yes</span>' : '<span style="color: var(--accent-danger);">No</span>'}</div>
-                <div style="margin-bottom: 0.5rem;"><strong>SSH Keys Found:</strong> ${data.ssh_keys_found && data.ssh_keys_found.length > 0 ? '<span style="color: var(--accent-2g);">' + data.ssh_keys_found.join(', ') + '</span>' : '<span style="color: var(--text-secondary);">None</span>'}</div>
-                <div style="margin-bottom: 0.5rem;"><strong>Ping Test:</strong> ${data.ping_test ? '<span style="color: var(--accent-2g);">✓ OK</span>' : '<span style="color: var(--accent-danger);">✗ Failed</span>'}</div>
-                <div><strong>SSH Test:</strong> ${data.ssh_test ? '<span style="color: var(--accent-2g);">✓ OK</span>' : '<span style="color: var(--accent-danger);">✗ Failed</span>'}</div>
-                ${data.error ? `<div style="margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--border-color); color: var(--accent-danger);"><strong>Error:</strong> ${data.error}</div>` : ''}
-            </div>
-        `;
+        const pwStatus = data.password_set
+            ? '<span class="diagnose-value--ok">Yes</span>'
+            : '<span class="diagnose-value--fail">No</span>';
+        const keysStatus = data.ssh_keys_found && data.ssh_keys_found.length > 0
+            ? '<span class="diagnose-value--ok">' + data.ssh_keys_found.join(', ') + '</span>'
+            : '<span class="diagnose-value--neutral">None</span>';
+        const pingStatus = data.ping_test
+            ? '<span class="diagnose-value--ok">\u2713 OK</span>'
+            : '<span class="diagnose-value--fail">\u2717 Failed</span>';
+        const sshStatus = data.ssh_test
+            ? '<span class="diagnose-value--ok">\u2713 OK</span>'
+            : '<span class="diagnose-value--fail">\u2717 Failed</span>';
+        const errorBlock = data.error
+            ? '<div class="diagnose-error-block"><strong>Error:</strong> ' + data.error + '</div>'
+            : '';
+
+        const statusHtml = '<div class="diagnose-info-block">' +
+            '<div class="diagnose-info-row"><strong>Host:</strong> ' + data.host + ':' + data.port + '</div>' +
+            '<div class="diagnose-info-row"><strong>User:</strong> ' + data.user + '</div>' +
+            '<div class="diagnose-info-row"><strong>Password Set:</strong> ' + pwStatus + '</div>' +
+            '<div class="diagnose-info-row"><strong>SSH Keys Found:</strong> ' + keysStatus + '</div>' +
+            '<div class="diagnose-info-row"><strong>Ping Test:</strong> ' + pingStatus + '</div>' +
+            '<div class="diagnose-info-row"><strong>SSH Test:</strong> ' + sshStatus + '</div>' +
+            errorBlock +
+            '</div>';
 
         let solutionHtml = '';
         if (!data.ssh_test && data.solution_text) {
-            solutionHtml = `
-                <div style="background: rgba(234, 179, 8, 0.1); border: 1px solid #eab308; border-radius: 0.5rem; padding: 1rem;">
-                    <div style="font-weight: 600; color: #eab308; margin-bottom: 0.5rem;">💡 Solution</div>
-                    <div style="color: var(--text-secondary); font-size: 0.9rem;">${data.solution_text}</div>
-                </div>
-            `;
+            solutionHtml = '<div class="diagnose-solution-block">' +
+                '<div class="diagnose-solution-title">Solution</div>' +
+                '<div class="diagnose-solution-text">' + data.solution_text + '</div>' +
+                '</div>';
         }
 
         showDiagnoseModal(statusHtml, solutionHtml, data.ssh_test);
@@ -688,26 +647,28 @@ async function diagnoseConnection() {
     setLoading(false);
 }
 
-function showDiagnoseModal(statusHtml, solutionHtml, isConnected) {
+function showDiagnoseModal(statusHtml, solutionHtml) {
     const existingModal = document.getElementById('diagnoseModal');
     if (existingModal) existingModal.remove();
 
     const modal = document.createElement('div');
     modal.id = 'diagnoseModal';
-    modal.style.cssText = 'position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); display: flex; justify-content: center; align-items: center; z-index: 9999;';
-    modal.innerHTML = `
-        <div style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 1rem; padding: 1.5rem; max-width: 500px; width: 90%; max-height: 90vh; overflow-y: auto;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                <h3 style="margin: 0; font-size: 1.25rem;">🔍 Connection Diagnosis</h3>
-                <button onclick="closeDiagnoseModal()" style="background: none; border: none; color: var(--text-secondary); font-size: 1.5rem; cursor: pointer; padding: 0; line-height: 1;">&times;</button>
-            </div>
-            ${statusHtml}
-            ${solutionHtml}
-            <div style="display: flex; gap: 0.75rem; justify-content: flex-end; margin-top: 1rem;">
-                <button onclick="closeDiagnoseModal()" style="padding: 0.75rem 1.5rem; background: var(--bg-dark); border: 1px solid var(--border-color); border-radius: 0.5rem; color: var(--text-primary); cursor: pointer;">OK</button>
-            </div>
-        </div>
-    `;
+    modal.className = 'diagnose-modal-overlay';
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+    modal.setAttribute('aria-label', 'Connection Diagnosis');
+    modal.innerHTML =
+        '<div class="diagnose-modal-content">' +
+        '<div class="diagnose-modal-header">' +
+        '<h3 class="diagnose-modal-title">Connection Diagnosis</h3>' +
+        '<button onclick="closeDiagnoseModal()" class="diagnose-modal-close" aria-label="Close">&times;</button>' +
+        '</div>' +
+        statusHtml +
+        solutionHtml +
+        '<div class="diagnose-modal-footer">' +
+        '<button onclick="closeDiagnoseModal()" class="btn btn-refresh">OK</button>' +
+        '</div>' +
+        '</div>';
     document.body.appendChild(modal);
 }
 
@@ -717,26 +678,37 @@ function closeDiagnoseModal() {
 }
 
 // ============== Utilities ==============
-function showNotification(message, type = 'success') {
+function showNotification(message, type) {
+    type = type || 'success';
     const notif = document.getElementById('notification');
     const text = document.getElementById('notificationText');
-    
+    const progress = document.getElementById('notificationProgress');
+
     if (notif && text) {
         notif.className = 'notification ' + type;
         text.textContent = message;
-        notif.style.display = 'flex';
+        notif.style.display = 'block';
 
-        setTimeout(() => {
-            notif.style.display = 'none';
-        }, 4000);
+        if (progress) {
+            progress.style.animation = 'none';
+            void progress.offsetHeight;
+            progress.style.animation = '';
+        }
+
+        clearTimeout(window._notifTimer);
+        window._notifTimer = setTimeout(dismissNotification, 5000);
     }
+}
+
+function dismissNotification() {
+    const notif = document.getElementById('notification');
+    if (notif) notif.style.display = 'none';
+    clearTimeout(window._notifTimer);
 }
 
 function setLoading(show) {
     const overlay = document.getElementById('loadingOverlay');
-    if (overlay) {
-        overlay.classList.toggle('active', show);
-    }
+    if (overlay) overlay.classList.toggle('active', show);
 }
 
 async function refreshStatus() {
@@ -751,32 +723,32 @@ async function refreshStatus() {
 
 // ============== Initialization ==============
 document.addEventListener('DOMContentLoaded', () => {
-    console.log('[App] Initializing...');
+    console.log('[App] Initializing v3...');
 
-    // Initialize WebSocket (or fallback to polling)
     initWebSocket();
-
-    // Check connection status
     checkConnection();
 
-    // Load initial data
     setTimeout(() => {
         loadCurrentWifiConfig();
         loadFileSplitSettings();
         updateTimeDisplay();
     }, 1000);
 
-    // Periodic time update
-    setInterval(updateTimeDisplay, 5000);
+    // Clear any previous time-update interval before creating a new one
+    if (_pollingTimeTimer) clearInterval(_pollingTimeTimer);
+    _pollingTimeTimer = setInterval(updateTimeDisplay, 5000);
 
-    console.log('[App] Initialized');
+    console.log('[App] v3 Initialized');
 });
 
-// Export functions for HTML onclick handlers
+// Export for HTML onclick handlers
 window.startCapture = startCapture;
 window.stopCapture = stopCapture;
 window.startAll = startAll;
 window.stopAll = stopAll;
+window.confirmStopAllPrompt = confirmStopAllPrompt;
+window.closeStopAllModal = closeStopAllModal;
+window.confirmStopAll = confirmStopAll;
 window.applyConfig = applyConfig;
 window.applyAllConfig = applyAllConfig;
 window.closeConfigModal = closeConfigModal;
@@ -788,3 +760,4 @@ window.diagnoseConnection = diagnoseConnection;
 window.closeDiagnoseModal = closeDiagnoseModal;
 window.loadCurrentWifiConfig = loadCurrentWifiConfig;
 window.refreshWifiConfig = refreshWifiConfig;
+window.dismissNotification = dismissNotification;

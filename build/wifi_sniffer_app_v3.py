@@ -1,26 +1,22 @@
 """
 WiFi Sniffer Desktop Application v3
 ===================================
-Professional desktop application with system tray support.
-Uses the new modular architecture with iwconfig optimization for 2G/5G.
+System-tray desktop wrapper for the v3 modular architecture.
 
-Author: AI Assistant
 Version: 3.0
 """
 
-import sys
-import os
-import threading
-import webbrowser
-import time
 import ctypes
-from pathlib import Path
+import logging
+import os
+import sys
+import threading
+import time
+import webbrowser
 
-# Add parent directory to path for importing the main module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Try to import pystray for system tray support
 try:
     import pystray
     from pystray import MenuItem as item
@@ -29,244 +25,150 @@ try:
 except ImportError:
     TRAY_AVAILABLE = False
     print("[WARNING] pystray or PIL not installed. System tray disabled.")
-    print("         Install with: pip install pystray pillow")
 
-# Import v3 modules
-try:
-    from wifi_sniffer import create_app, socketio, is_socketio_enabled
-    from wifi_sniffer.config import SERVER_PORT, DOWNLOADS_FOLDER
-    from wifi_sniffer.capture import capture_manager
-    from wifi_sniffer.ssh import ssh_pool
-except ImportError as e:
-    print(f"[ERROR] Import error: {e}")
-    # When running as bundled exe, modules are in the same directory
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from wifi_sniffer import create_app, socketio, is_socketio_enabled
-    from wifi_sniffer.config import SERVER_PORT, DOWNLOADS_FOLDER
-    from wifi_sniffer.capture import capture_manager
-    from wifi_sniffer.ssh import ssh_pool
+from wifi_sniffer_v3 import create_app, socketio, is_socketio_enabled
+from wifi_sniffer_v3.config import SERVER_PORT, DOWNLOADS_FOLDER, VERSION
+from wifi_sniffer_v3.services import CaptureService
+from wifi_sniffer_v3.ssh import ssh_client
+
+logger = logging.getLogger(__name__)
 
 
 class WiFiSnifferAppV3:
-    """Main application class with system tray support - v3"""
-    
+    """Desktop application with optional system-tray icon."""
+
     def __init__(self):
         self.server_thread = None
         self.server_running = False
         self.icon = None
         self.app = None
-        self.port = int(os.environ.get('FLASK_PORT', SERVER_PORT))
+        self.port = int(os.environ.get("FLASK_PORT", SERVER_PORT))
         self.host = "127.0.0.1"
-        
+        self._capture_svc: CaptureService | None = None
+
     def create_icon_image(self, color="green"):
-        """Create a simple icon image for the system tray"""
         size = 64
-        image = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
-        
-        # Color scheme
-        if color == "green":
-            main_color = (34, 197, 94, 255)  # Green - connected
-        elif color == "red":
-            main_color = (239, 68, 68, 255)  # Red - disconnected
-        elif color == "yellow":
-            main_color = (245, 158, 11, 255)  # Yellow - capturing
-        else:
-            main_color = (148, 163, 184, 255)  # Gray - idle
-        
-        # Draw concentric arcs (WiFi signal style)
-        center_x, center_y = size // 2, size - 10
-        
-        # Draw three arcs
-        for i, radius in enumerate([12, 22, 32]):
-            bbox = [
-                center_x - radius, center_y - radius,
-                center_x + radius, center_y + radius
-            ]
-            draw.arc(bbox, 200, 340, fill=main_color, width=4)
-        
-        # Draw center dot
-        dot_radius = 5
-        draw.ellipse([
-            center_x - dot_radius, center_y - dot_radius,
-            center_x + dot_radius, center_y + dot_radius
-        ], fill=main_color)
-        
+
+        colours = {
+            "green": (34, 197, 94, 255),
+            "red": (239, 68, 68, 255),
+            "yellow": (245, 158, 11, 255),
+        }
+        main = colours.get(color, (148, 163, 184, 255))
+
+        cx, cy = size // 2, size - 10
+        for radius in (12, 22, 32):
+            bbox = [cx - radius, cy - radius, cx + radius, cy + radius]
+            draw.arc(bbox, 200, 340, fill=main, width=4)
+        r = 5
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=main)
         return image
-    
-    def get_status_text(self):
-        """Get current capture status as text"""
+
+    def _status_text(self):
+        if not self._capture_svc:
+            return "Idle"
         try:
-            status = capture_manager.get_all_status()
-            running = []
-            for band in ["2G", "5G", "6G"]:
-                if status[band]["running"]:
-                    running.append(band)
-            
-            if running:
-                return f"Capturing: {', '.join(running)}"
-        except:
-            pass
-        return "Idle"
-    
+            st = self._capture_svc.get_all_status()
+            running = [b for b in ("2G", "5G", "6G") if st[b]["running"]]
+            return f"Capturing: {', '.join(running)}" if running else "Idle"
+        except Exception:
+            return "Idle"
+
     def open_browser(self, icon=None, item=None):
-        """Open the web interface in default browser"""
-        url = f"http://{self.host}:{self.port}"
-        webbrowser.open(url)
-    
+        webbrowser.open(f"http://{self.host}:{self.port}")
+
     def open_downloads(self, icon=None, item=None):
-        """Open the downloads folder"""
         try:
             os.startfile(DOWNLOADS_FOLDER)
-        except:
+        except Exception:
             pass
-    
+
     def show_status(self, icon=None, item=None):
-        """Show current status in a message box"""
-        status = self.get_status_text()
         try:
-            connected = "Connected" if ssh_pool.test_connection() else "Disconnected"
-        except:
-            connected = "Unknown"
-        
-        message = f"WiFi Sniffer Control Panel v3\n\n"
-        message += f"Server: http://{self.host}:{self.port}\n"
-        message += f"Router: {connected}\n"
-        message += f"Status: {status}\n"
-        message += f"\nDownload folder:\n{DOWNLOADS_FOLDER}"
-        message += f"\n\nNew in v3:\n- iwconfig optimization for 2G/5G"
-        
-        ctypes.windll.user32.MessageBoxW(0, message, "WiFi Sniffer Status", 0x40)
-    
+            conn = "Connected" if ssh_client.test_connection() else "Disconnected"
+        except Exception:
+            conn = "Unknown"
+        msg = (
+            f"WiFi Sniffer Control Panel v{VERSION}\n\n"
+            f"Server: http://{self.host}:{self.port}\n"
+            f"Router: {conn}\n"
+            f"Status: {self._status_text()}\n"
+            f"\nDownload folder:\n{DOWNLOADS_FOLDER}"
+        )
+        ctypes.windll.user32.MessageBoxW(0, msg, "WiFi Sniffer Status", 0x40)
+
     def quit_app(self, icon=None, item=None):
-        """Quit the application"""
         self.server_running = False
         if self.icon:
             self.icon.stop()
         os._exit(0)
-    
-    def update_icon(self):
-        """Update icon based on current status"""
-        if not self.icon or not TRAY_AVAILABLE:
+
+    def _update_icon(self):
+        if not self.icon or not TRAY_AVAILABLE or not self._capture_svc:
             return
-        
         try:
-            status = capture_manager.get_all_status()
-            any_running = any(status[band]["running"] for band in ["2G", "5G", "6G"])
-            
-            if any_running:
-                self.icon.icon = self.create_icon_image("yellow")
-            else:
-                self.icon.icon = self.create_icon_image("green")
-        except:
+            st = self._capture_svc.get_all_status()
+            any_running = any(st[b]["running"] for b in ("2G", "5G", "6G"))
+            self.icon.icon = self.create_icon_image("yellow" if any_running else "green")
+        except Exception:
             pass
-    
-    def status_monitor(self):
-        """Background thread to monitor and update status"""
+
+    def _status_monitor(self):
         while self.server_running:
-            try:
-                self.update_icon()
-            except:
-                pass
+            self._update_icon()
             time.sleep(3)
-    
-    def run_server(self):
-        """Run Flask server in background thread"""
-        import logging
-        
-        # Suppress Flask's default logging
-        log = logging.getLogger('werkzeug')
-        log.setLevel(logging.ERROR)
-        
+
+    def _run_server(self):
+        import logging as _logging
+        _logging.getLogger("werkzeug").setLevel(_logging.ERROR)
         try:
-            # Check if SocketIO is enabled and use appropriate run method
             if is_socketio_enabled() and socketio is not None:
-                print("[INFO] Starting server with SocketIO...")
-                socketio.run(
-                    self.app,
-                    host=self.host,
-                    port=self.port,
-                    debug=False,
-                    use_reloader=False,
-                    allow_unsafe_werkzeug=True
-                )
+                socketio.run(self.app, host=self.host, port=self.port,
+                             debug=False, use_reloader=False, allow_unsafe_werkzeug=True)
             else:
-                print("[INFO] Starting server without SocketIO (polling mode)...")
-                self.app.run(
-                    host=self.host,
-                    port=self.port,
-                    debug=False,
-                    use_reloader=False,
-                    threaded=True
-                )
-        except Exception as e:
-            print(f"[ERROR] Server error: {e}")
-            import traceback
-            traceback.print_exc()
+                self.app.run(host=self.host, port=self.port,
+                             debug=False, use_reloader=False, threaded=True)
+        except Exception:
+            logger.exception("Server error")
             self.server_running = False
-    
-    def create_menu(self):
-        """Create system tray menu"""
-        return pystray.Menu(
-            item('🌐 Open Web Panel', self.open_browser, default=True),
-            item('📁 Open Downloads', self.open_downloads),
-            pystray.Menu.SEPARATOR,
-            item('ℹ️ Status', self.show_status),
-            pystray.Menu.SEPARATOR,
-            item('❌ Exit', self.quit_app)
-        )
-    
+
     def run(self):
-        """Main entry point"""
         print("=" * 60)
-        print("  WiFi Sniffer Desktop Application v3.0")
+        print(f"  WiFi Sniffer Desktop Application v{VERSION}")
         print("=" * 60)
         print(f"  Server: http://{self.host}:{self.port}")
         print(f"  Downloads: {DOWNLOADS_FOLDER}")
         print("-" * 60)
-        print("  New in v3:")
-        print("  - iwconfig optimization for 2G/5G channel config")
-        print("  - Faster channel changes without WiFi restart")
-        print("-" * 60)
-        
-        # Create Flask app
-        print("[INFO] Creating Flask application...")
+
         self.app = create_app()
-        print("[OK] Flask application created")
-        
+        self._capture_svc = self.app.extensions.get("capture_service")
         self.server_running = True
-        
-        # Start Flask server in background thread
-        self.server_thread = threading.Thread(target=self.run_server, daemon=True)
+
+        self.server_thread = threading.Thread(target=self._run_server, daemon=True)
         self.server_thread.start()
-        
-        # Wait a moment for server to start
         time.sleep(2)
-        
-        # Open browser automatically
         self.open_browser()
-        
+
         if TRAY_AVAILABLE:
-            print("[INFO] System tray enabled. Right-click the icon for options.")
-            print("[INFO] The application is now running in the system tray.")
-            
-            # Start status monitor
-            monitor_thread = threading.Thread(target=self.status_monitor, daemon=True)
-            monitor_thread.start()
-            
-            # Create and run system tray icon
+            threading.Thread(target=self._status_monitor, daemon=True).start()
             self.icon = pystray.Icon(
                 "WiFi Sniffer v3",
                 self.create_icon_image("green"),
-                "WiFi Sniffer Control Panel v3",
-                self.create_menu()
+                f"WiFi Sniffer Control Panel v{VERSION}",
+                pystray.Menu(
+                    item("Open Web Panel", self.open_browser, default=True),
+                    item("Open Downloads", self.open_downloads),
+                    pystray.Menu.SEPARATOR,
+                    item("Status", self.show_status),
+                    pystray.Menu.SEPARATOR,
+                    item("Exit", self.quit_app),
+                ),
             )
-            
             self.icon.run()
         else:
             print("[INFO] Running without system tray. Press Ctrl+C to stop.")
-            print("[INFO] Keep this window open while using the application.")
-            
             try:
                 while self.server_running:
                     time.sleep(1)
@@ -276,16 +178,13 @@ class WiFiSnifferAppV3:
 
 
 def main():
-    """Main function"""
-    if sys.platform == 'win32':
+    if sys.platform == "win32":
         try:
-            ctypes.windll.kernel32.SetConsoleTitleW("WiFi Sniffer Control Panel v3")
-        except:
+            ctypes.windll.kernel32.SetConsoleTitleW(f"WiFi Sniffer Control Panel v{VERSION}")
+        except Exception:
             pass
-    
-    app_instance = WiFiSnifferAppV3()
-    app_instance.run()
+    WiFiSnifferAppV3().run()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

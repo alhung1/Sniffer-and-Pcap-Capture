@@ -2,7 +2,7 @@
 
 Web-based control panel for WiFi packet capture using OpenWrt Monitor Mode. Supports simultaneous or individual capture of 2.4G / 5G / 6G bands.
 
-**Version:** 2.1 | **Last Updated:** 2026-01-02
+**Version:** 2.2 | **Last Updated:** 2026-01-28
 
 ---
 
@@ -121,9 +121,10 @@ Double-click **`start_server.bat`** for the classic v1 experience.
 | Version | File | Size |
 |---------|------|------|
 | v1 | `build\dist\WiFi_Sniffer_Control_Panel.exe` | 24.7 MB |
-| **v2** | `build\dist\WiFi_Sniffer_Control_Panel_v2.exe` | **26.4 MB** |
+| **v2** | `build\dist\WiFi_Sniffer_Control_Panel_v2.exe` | **38.6 MB** |
+| v3 | `build\dist\WiFi_Sniffer_Control_Panel_v3.exe` | 38.6 MB |
 
-Just double-click the EXE file - no Python installation needed!
+Build the EXE: run `build\build_v2.bat` from the project directory. Double-click the EXE - no Python installation needed!
 
 ### Method 4: Manual Launch
 
@@ -575,6 +576,19 @@ If you encounter issues, please collect:
 ---
 
 ## 🔄 Changelog
+
+### v2.2 (2026-01-28)
+- **Optimized**: Channel apply flow now uses iwconfig (2G/5G) and cfg80211tool (6G) directly — no `wifi load` required
+  - 2G/5G: `iwconfig athX Channel N`
+  - 6G: `cfg80211tool ath1 channel N 3`
+  - Faster channel switching without full WiFi restart
+- **Optimized**: Reduced SSH round-trips during channel verification
+  - `get_current_channel_from_iwconfig()` now uses single SSH call with Python regex parsing
+  - Saves 2-4 SSH calls per Apply Config operation
+- **Improved**: SSH now uses publickey-only authentication (no password prompts or "password error" messages)
+- **Improved**: Frontend sends 3 config POSTs in parallel using `Promise.all` for faster UI response
+- **Improved**: UI tooltip on "Apply Config" button explains runtime vs UCI channel difference
+- **Cleanup**: Removed unused `apply_2g_5g_with_iwconfig()` function to reduce code duplication
 
 ### v2.1 (2026-01-02)
 - **Fixed**: Channel configuration now properly applies to OpenWrt
