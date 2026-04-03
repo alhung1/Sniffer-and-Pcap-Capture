@@ -2,16 +2,17 @@
 WiFi Sniffer Web Control Panel
 ==============================
 Flask application factory for v3.
-
-Version: 3.0
 """
 
+from __future__ import annotations
+
 import logging
-import os
 import sys
+from pathlib import Path
 
 from flask import Flask
 
+from .config import CONFIG, ConfigError, ENV_FILES_LOADED, SECRET_KEY, validate_runtime_config
 from .logging_config import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -29,46 +30,57 @@ capture_service = None
 
 
 def create_app():
-    """Application factory – returns the configured Flask app."""
+    """Application factory that returns the configured Flask app."""
     global socketio, _socketio_enabled
     global interface_service, time_sync_service, wifi_config_service, capture_service
 
-    setup_logging(
-        log_level=os.environ.get("LOG_LEVEL", "INFO"),
-        log_file=os.environ.get("LOG_FILE"),
-    )
+    setup_logging(log_level=CONFIG.log_level, log_file=CONFIG.log_file)
 
-    # PyInstaller support
+    try:
+        validate_runtime_config(CONFIG)
+    except ConfigError:
+        logger.exception("Runtime configuration validation failed")
+        raise
+
+    for env_file in ENV_FILES_LOADED:
+        logger.info("Loaded environment overrides from %s", env_file)
+
+    downloads_dir = Path(CONFIG.downloads_folder).expanduser()
+    downloads_dir.mkdir(parents=True, exist_ok=True)
+
     if getattr(sys, "frozen", False):
-        base_dir = sys._MEIPASS
-        logger.info("Running as bundled exe, base_dir=%s", base_dir)
+        base_dir = Path(sys._MEIPASS)
+        logger.info("Running as bundled executable, base_dir=%s", base_dir)
     else:
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        base_dir = Path(__file__).resolve().parent.parent
         logger.info("Running from source, base_dir=%s", base_dir)
 
-    template_folder = os.path.join(base_dir, "templates")
-    static_folder = os.path.join(base_dir, "wifi_sniffer_v3", "static")
-    if not os.path.exists(static_folder):
-        static_folder = os.path.join(base_dir, "static")
+    template_folder = base_dir / "templates"
+    static_folder = base_dir / "wifi_sniffer_v3" / "static"
+    if not static_folder.exists():
+        static_folder = base_dir / "static"
 
     logger.info("Templates: %s | Static: %s", template_folder, static_folder)
 
-    from .config import SECRET_KEY
-    app = Flask(__name__, template_folder=template_folder, static_folder=static_folder)
+    app = Flask(
+        __name__,
+        template_folder=str(template_folder),
+        static_folder=str(static_folder),
+    )
     app.config["SECRET_KEY"] = SECRET_KEY
 
     # ---- SocketIO ----
     socketio, _socketio_enabled = _init_socketio(app)
 
     # ---- Services ----
-    from .services import InterfaceService, TimeSyncService, WifiConfigService, CaptureService
+    from .services import CaptureService, InterfaceService, TimeSyncService, WifiConfigService
 
     interface_service = InterfaceService()
     time_sync_service = TimeSyncService()
     wifi_config_service = WifiConfigService(interface_service)
     capture_service = CaptureService(interface_service, time_sync_service, wifi_config_service)
 
-    # Store references on app for routes to access
+    app.extensions["runtime_config"] = CONFIG
     app.extensions["interface_service"] = interface_service
     app.extensions["time_sync_service"] = time_sync_service
     app.extensions["wifi_config_service"] = wifi_config_service
@@ -76,6 +88,7 @@ def create_app():
 
     # ---- Blueprints ----
     from .routes import api_bp, views_bp
+
     app.register_blueprint(api_bp)
     app.register_blueprint(views_bp)
 
@@ -84,16 +97,13 @@ def create_app():
         capture_service.set_socketio(socketio)
         _register_socketio_events()
     else:
-        logger.info("SocketIO disabled – polling mode")
+        logger.info("SocketIO disabled, using polling mode")
 
     return app
 
 
-# ------------------------------------------------------------------
-# SocketIO helpers
-# ------------------------------------------------------------------
-
 def _init_socketio(app):
+    """Try supported SocketIO backends, then fall back gracefully."""
     from flask_socketio import SocketIO
 
     for mode in ("threading", "eventlet", "gevent", None):
@@ -103,14 +113,14 @@ def _init_socketio(app):
             sio.init_app(app, async_mode=mode, cors_allowed_origins="*")
             logger.info("SocketIO OK with async_mode='%s'", mode)
             return sio, True
-        except Exception as e:
-            logger.warning("async_mode='%s' failed: %s", mode, e)
+        except Exception as exc:
+            logger.warning("async_mode='%s' failed: %s", mode, exc)
 
-    logger.warning("All SocketIO modes failed – creating fallback")
+    logger.warning("All SocketIO modes failed, creating fallback")
     try:
         return SocketIO(), False
-    except Exception as e:
-        logger.error("SocketIO fallback creation failed: %s", e)
+    except Exception as exc:
+        logger.error("SocketIO fallback creation failed: %s", exc)
         return None, False
 
 
@@ -136,45 +146,48 @@ def _register_socketio_events():
     def handle_request_connection():
         global _startup_cleanup_done
         from .ssh import ssh_client
+
         connected = ssh_client.test_connection()
         if connected:
             if not _startup_cleanup_done:
-                logger.info("First connection – running startup cleanup")
+                logger.info("First connection, running startup cleanup")
                 capture_service.cleanup_remote_processes()
                 _startup_cleanup_done = True
             if not interface_service.detection_status["detected"]:
                 interface_service.detect_interfaces()
                 wifi_config_service.sync_channel_config_from_openwrt()
 
-        socketio.emit("connection_update", {
-            "connected": connected,
-            "interfaces": interface_service.interfaces,
-            "detection_status": interface_service.detection_status,
-        })
+        socketio.emit(
+            "connection_update",
+            {
+                "connected": connected,
+                "interfaces": interface_service.interfaces,
+                "detection_status": interface_service.detection_status,
+            },
+        )
 
-
-# ------------------------------------------------------------------
-# Public helpers
-# ------------------------------------------------------------------
 
 def broadcast_status_update():
     if socketio and _socketio_enabled:
         try:
             socketio.emit("status_update", capture_service.get_all_status())
-        except Exception as e:
-            logger.debug("broadcast_status_update error: %s", e)
+        except Exception as exc:
+            logger.debug("broadcast_status_update error: %s", exc)
 
 
 def broadcast_connection_update(connected: bool):
     if socketio and _socketio_enabled:
         try:
-            socketio.emit("connection_update", {
-                "connected": connected,
-                "interfaces": interface_service.interfaces,
-                "detection_status": interface_service.detection_status,
-            })
-        except Exception as e:
-            logger.debug("broadcast_connection_update error: %s", e)
+            socketio.emit(
+                "connection_update",
+                {
+                    "connected": connected,
+                    "interfaces": interface_service.interfaces,
+                    "detection_status": interface_service.detection_status,
+                },
+            )
+        except Exception as exc:
+            logger.debug("broadcast_connection_update error: %s", exc)
 
 
 def is_socketio_enabled():
@@ -196,8 +209,15 @@ def is_startup_cleanup_done():
 
 
 __all__ = [
-    "create_app", "socketio",
-    "broadcast_status_update", "broadcast_connection_update",
-    "is_socketio_enabled", "perform_startup_cleanup", "is_startup_cleanup_done",
-    "interface_service", "time_sync_service", "wifi_config_service", "capture_service",
+    "create_app",
+    "socketio",
+    "broadcast_status_update",
+    "broadcast_connection_update",
+    "is_socketio_enabled",
+    "perform_startup_cleanup",
+    "is_startup_cleanup_done",
+    "interface_service",
+    "time_sync_service",
+    "wifi_config_service",
+    "capture_service",
 ]

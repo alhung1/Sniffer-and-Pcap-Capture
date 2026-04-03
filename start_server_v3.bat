@@ -17,7 +17,7 @@ echo  - Service-oriented architecture (5 focused services)
 echo  - Python logging with configurable levels
 echo  - Thread-safe SSH client
 echo  - Input validation on all API endpoints
-echo  - 37 smoke tests for self-verification
+echo  - 48 tests for self-verification
 echo.
 echo [INFO] Starting web server on port %FLASK_PORT%...
 echo [INFO] Please wait for the browser to open automatically...

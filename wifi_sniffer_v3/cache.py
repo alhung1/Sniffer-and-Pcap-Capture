@@ -4,13 +4,30 @@ Cache Layer
 TTL-based caching for expensive operations.
 """
 
+from __future__ import annotations
+
 import threading
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, TypedDict
 
 from .config import CONNECTION_CACHE_TTL, INTERFACE_CACHE_TTL
 
 _SENTINEL = object()
+
+
+class ConnectionStatusPayload(TypedDict):
+    connected: bool
+    host: str
+    port: int
+    user: str
+    auth_method: str
+    error: Optional[str]
+
+
+class InterfaceMappingPayload(TypedDict):
+    interfaces: dict[str, str]
+    uci_wifi_map: dict[str, str]
+    detection_status: dict[str, Any]
 
 
 class CacheEntry:
@@ -82,8 +99,12 @@ class StatusCache:
         with self._cache_lock:
             self._cache.clear()
 
-    def get_or_compute(self, key: str, compute_fn: Callable,
-                       ttl: Optional[float] = None) -> Any:
+    def get_or_compute(
+        self,
+        key: str,
+        compute_fn: Callable[[], Any],
+        ttl: Optional[float] = None,
+    ) -> Any:
         """
         Return cached value or compute, cache, and return.
 
@@ -102,25 +123,23 @@ class StatusCache:
 status_cache = StatusCache()
 
 
-# ---- Convenience helpers (with corrected type hints) ----
-
-def get_cached_connection_status() -> Any:
-    """Return cached connection-status dict, or ``_SENTINEL`` if expired."""
+def get_cached_connection_status() -> Optional[ConnectionStatusPayload]:
+    """Return the cached connection-status payload, or ``None`` if expired."""
     result = status_cache.get("connection_status")
     return None if result is _SENTINEL else result
 
 
-def set_cached_connection_status(result: dict) -> None:
-    """Cache the full connection-status dict."""
+def set_cached_connection_status(result: ConnectionStatusPayload) -> None:
+    """Cache the full connection-status payload."""
     status_cache.set("connection_status", result)
 
 
-def get_cached_interface_mapping() -> Optional[dict]:
+def get_cached_interface_mapping() -> Optional[InterfaceMappingPayload]:
     result = status_cache.get("interface_mapping")
     return None if result is _SENTINEL else result
 
 
-def set_cached_interface_mapping(mapping: dict) -> None:
+def set_cached_interface_mapping(mapping: InterfaceMappingPayload) -> None:
     status_cache.set("interface_mapping", mapping)
 
 

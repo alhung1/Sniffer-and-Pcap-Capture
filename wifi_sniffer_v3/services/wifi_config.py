@@ -9,6 +9,7 @@ import re
 import time
 from typing import Any, Dict, Optional, Tuple
 
+from ..remote import build_cleanup_stale_captures_command
 from ..ssh import run_ssh_command
 
 logger = logging.getLogger(__name__)
@@ -177,7 +178,9 @@ class WifiConfigService:
     # ------------------------------------------------------------------
 
     def _cleanup_tcpdump(self):
-        run_ssh_command("killall tcpdump 2>/dev/null; echo DONE", timeout=10)
+        ok, stdout, stderr = run_ssh_command(build_cleanup_stale_captures_command(), timeout=10)
+        if not ok:
+            logger.warning("App capture cleanup before config apply failed: %s", stderr or stdout)
 
     def _read_channel_from_iwconfig(self, interface: str) -> Optional[int]:
         try:

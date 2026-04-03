@@ -144,8 +144,8 @@
                             <div class="stat-label">Duration</div>
                         </div>
                         <div class="stat-item">
-                            <div class="stat-value" id="packets-2g">{{ status['2G']['packets'] }}</div>
-                            <div class="stat-label">Est. Packets</div>
+                            <div class="stat-value" id="packets-2g">{{ status['2G']['estimated_packets'] or status['2G']['packets'] }}</div>
+                            <div class="stat-label">Estimated Packets</div>
                         </div>
                     </div>
                     <div class="channel-config">
@@ -204,8 +204,8 @@
                             <div class="stat-label">Duration</div>
                         </div>
                         <div class="stat-item">
-                            <div class="stat-value" id="packets-5g">{{ status['5G']['packets'] }}</div>
-                            <div class="stat-label">Est. Packets</div>
+                            <div class="stat-value" id="packets-5g">{{ status['5G']['estimated_packets'] or status['5G']['packets'] }}</div>
+                            <div class="stat-label">Estimated Packets</div>
                         </div>
                     </div>
                     <div class="channel-config">
@@ -264,8 +264,8 @@
                             <div class="stat-label">Duration</div>
                         </div>
                         <div class="stat-item">
-                            <div class="stat-value" id="packets-6g">{{ status['6G']['packets'] }}</div>
-                            <div class="stat-label">Est. Packets</div>
+                            <div class="stat-value" id="packets-6g">{{ status['6G']['estimated_packets'] or status['6G']['packets'] }}</div>
+                            <div class="stat-label">Estimated Packets</div>
                         </div>
                     </div>
                     <div class="channel-config">

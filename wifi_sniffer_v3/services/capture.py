@@ -4,17 +4,44 @@ Capture Service
 Manages WiFi packet capture sessions (start / stop / monitor).
 """
 
+from __future__ import annotations
+
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional
 
-from ..config import MONITOR_INTERVAL, MONITOR_ERROR_THRESHOLD
+from ..config import MONITOR_ERROR_THRESHOLD, MONITOR_INTERVAL
+from ..remote import (
+    RemoteCommandError,
+    build_capture_size_command,
+    build_cleanup_stale_captures_command,
+    build_start_capture_command,
+    build_stop_capture_command,
+    make_capture_paths,
+    new_session_id,
+    validate_band,
+    validate_interface,
+)
 from ..ssh import run_ssh_command
 from .file_download import FileDownloader
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CaptureBandState:
+    running: bool = False
+    start_time: Optional[datetime] = None
+    estimated_packets: int = 0
+    file_size_bytes: int = 0
+    session_id: Optional[str] = None
+    remote_pcap_path: Optional[str] = None
+    remote_pid_path: Optional[str] = None
+    pending_action: Optional[str] = None
+    last_error: Optional[str] = None
 
 
 class CaptureService:
@@ -32,21 +59,21 @@ class CaptureService:
         self._wifi_svc = wifi_config_service
         self._downloader = FileDownloader()
 
-        self._status: Dict[str, Dict[str, Any]] = {
-            "2G": {"running": False, "start_time": None, "packets": 0},
-            "5G": {"running": False, "start_time": None, "packets": 0},
-            "6G": {"running": False, "start_time": None, "packets": 0},
+        self._status = {
+            "2G": CaptureBandState(),
+            "5G": CaptureBandState(),
+            "6G": CaptureBandState(),
         }
         self._status_lock = threading.Lock()
         self._socketio = None
 
-        self.file_split_config: Dict[str, Any] = {
+        self.file_split_config: dict[str, Any] = {
             "enabled": False,
             "size_mb": 200,
         }
 
-        self._monitor_error_count: Dict[str, int] = {"2G": 0, "5G": 0, "6G": 0}
-        self._monitor_last_error: Dict[str, Optional[str]] = {"2G": None, "5G": None, "6G": None}
+        self._monitor_error_count: dict[str, int] = {"2G": 0, "5G": 0, "6G": 0}
+        self._monitor_last_error: dict[str, Optional[str]] = {"2G": None, "5G": None, "6G": None}
 
         self.last_connection_error: Optional[str] = None
 
@@ -61,200 +88,269 @@ class CaptureService:
         if self._socketio:
             try:
                 self._socketio.emit("status_update", self.get_all_status())
-            except Exception as e:
-                logger.debug("Broadcast error: %s", e)
+            except Exception as exc:
+                logger.debug("Broadcast error: %s", exc)
 
     # ------------------------------------------------------------------
     # Status queries
     # ------------------------------------------------------------------
 
-    def get_status(self, band: str) -> Dict[str, Any]:
-        with self._status_lock:
-            st = self._status[band].copy()
-            if st["running"] and st["start_time"]:
-                secs = int((datetime.now() - st["start_time"]).total_seconds())
-                m, s = divmod(secs, 60)
-                st["duration"] = f"{m:02d}:{s:02d}"
-            else:
-                st["duration"] = None
-            return st
+    def _snapshot_status(self, band: str, state: CaptureBandState) -> dict[str, Any]:
+        status = {
+            "running": state.running,
+            "start_time": state.start_time,
+            "packets": state.estimated_packets,
+            "estimated_packets": state.estimated_packets,
+            "file_size_bytes": state.file_size_bytes,
+            "session_id": state.session_id,
+            "pending_action": state.pending_action,
+            "last_error": state.last_error,
+        }
+        if state.pending_action == "starting":
+            status["state"] = "starting"
+        elif state.pending_action == "stopping":
+            status["state"] = "stopping"
+        elif state.running:
+            status["state"] = "running"
+        else:
+            status["state"] = "idle"
 
-    def get_all_status(self) -> Dict[str, Dict[str, Any]]:
-        return {b: self.get_status(b) for b in ("2G", "5G", "6G")}
+        if state.running and state.start_time:
+            secs = int((datetime.now() - state.start_time).total_seconds())
+            mins, secs = divmod(secs, 60)
+            status["duration"] = f"{mins:02d}:{secs:02d}"
+        else:
+            status["duration"] = None
+        return status
+
+    def get_status(self, band: str) -> dict[str, Any]:
+        normalized_band = validate_band(band)
+        with self._status_lock:
+            return self._snapshot_status(normalized_band, self._status[normalized_band])
+
+    def get_all_status(self) -> dict[str, dict[str, Any]]:
+        with self._status_lock:
+            return {
+                band: self._snapshot_status(band, state)
+                for band, state in self._status.items()
+            }
 
     # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
 
-    def cleanup_remote_processes(self) -> Tuple[bool, str]:
-        """Kill stale tcpdump and remove temp pcap files."""
+    def cleanup_remote_processes(self) -> tuple[bool, str]:
+        """Clean up only app-managed capture processes and capture files."""
         try:
-            logger.info("Cleaning up stale tcpdump processes...")
-            ok, stdout, stderr = run_ssh_command(
-                "killall tcpdump 2>/dev/null; echo 'CLEANUP_DONE'", timeout=10,
-            )
+            logger.info("Cleaning up stale app capture processes")
+            ok, stdout, stderr = run_ssh_command(build_cleanup_stale_captures_command(), timeout=10)
             if ok and "CLEANUP_DONE" in stdout:
-                run_ssh_command(
-                    "rm -f /tmp/*.pcap /tmp/*.pcap[0-9]* 2>/dev/null", timeout=10,
-                )
-                logger.info("Cleanup completed")
+                logger.info("App capture cleanup completed")
                 return True, "Cleanup completed"
-            logger.warning("Cleanup command returned: %s %s", stdout, stderr)
-            return False, f"Cleanup failed: {stderr or stdout}"
-        except Exception as e:
-            logger.error("Cleanup error: %s", e)
-            return False, f"Cleanup error: {e}"
+
+            details = (stderr or stdout or "unknown error").strip()
+            logger.warning("Cleanup command returned: %s", details)
+            return False, f"Cleanup failed: {details}"
+        except Exception as exc:
+            logger.error("Cleanup error: %s", exc)
+            return False, f"Cleanup error: {exc}"
 
     # ------------------------------------------------------------------
     # Start
     # ------------------------------------------------------------------
 
-    def start_capture(self, band: str, auto_sync_time: bool = True) -> Tuple[bool, str]:
-        interface = self._iface_svc.interfaces.get(band)
+    def start_capture(self, band: str, auto_sync_time: bool = True) -> tuple[bool, str]:
+        normalized_band = validate_band(band)
+        interface = self._iface_svc.interfaces.get(normalized_band)
         if not interface:
-            return False, f"Unknown band: {band}"
-
-        with self._status_lock:
-            if self._status[band]["running"]:
-                return False, f"{band} capture already running"
+            return False, f"Unknown band: {normalized_band}"
 
         try:
-            if auto_sync_time:
-                others_running = any(
-                    self._status[b]["running"] for b in ("2G", "5G", "6G") if b != band
-                )
-                if not others_running:
-                    logger.info("Syncing time before %s capture", band)
-                    self._time_svc.sync_time()
+            validate_interface(interface)
+        except RemoteCommandError as exc:
+            return False, str(exc)
 
-            remote_path = f"/tmp/{band}.pcap"
+        session_id = new_session_id()
+        paths = make_capture_paths(normalized_band, session_id)
 
-            if self.file_split_config["enabled"]:
-                size_mb = self.file_split_config["size_mb"]
-                tcpdump = f"tcpdump -i {interface} -U -s0 -w {remote_path} -C {size_mb}"
-            else:
-                tcpdump = f"tcpdump -i {interface} -U -s0 -w {remote_path}"
-
-            cmd = (
-                f'PID=$(ps | grep "tcpdump -i {interface}" | grep -v grep | awk \'{{print $1}}\');'
-                f' [ -n "$PID" ] && kill $PID 2>/dev/null;'
-                f" rm -f {remote_path} {remote_path}[0-9]*;"
-                f" ({tcpdump} &);"
-                f" sleep 1;"
-                f' ps | grep "tcpdump -i {interface}" | grep -v grep'
-                f" && echo 'TCPDUMP_STARTED' || echo 'TCPDUMP_FAILED'"
+        with self._status_lock:
+            state = self._status[normalized_band]
+            if state.running or state.pending_action:
+                return False, f"{normalized_band} capture already running"
+            state.pending_action = "starting"
+            state.last_error = None
+            state.session_id = session_id
+            state.remote_pcap_path = paths.remote_pcap_path
+            state.remote_pid_path = paths.remote_pid_path
+            others_running = any(
+                other.running
+                for other_band, other in self._status.items()
+                if other_band != normalized_band
             )
 
-            ok, stdout, stderr = run_ssh_command(cmd, timeout=15)
-            if not ok or "TCPDUMP_FAILED" in stdout:
-                return False, f"Failed to start tcpdump: {stderr or stdout}"
-            if "TCPDUMP_STARTED" not in stdout:
-                return False, "tcpdump verification failed"
+        try:
+            if auto_sync_time and not others_running:
+                logger.info("Syncing time before %s capture", normalized_band)
+                self._time_svc.sync_time()
+
+            split_size_mb = None
+            if self.file_split_config["enabled"]:
+                split_size_mb = self.file_split_config["size_mb"]
+
+            command = build_start_capture_command(interface, paths, split_size_mb=split_size_mb)
+            ok, stdout, stderr = run_ssh_command(command, timeout=15)
+            if not ok or "TCPDUMP_FAILED" in stdout or "TCPDUMP_STARTED" not in stdout:
+                details = (stderr or stdout or "verification failed").strip()
+                self._mark_start_failed(normalized_band, details)
+                return False, f"Failed to start tcpdump: {details}"
 
             with self._status_lock:
-                self._status[band]["running"] = True
-                self._status[band]["start_time"] = datetime.now()
-                self._status[band]["packets"] = 0
+                state = self._status[normalized_band]
+                state.running = True
+                state.start_time = datetime.now()
+                state.estimated_packets = 0
+                state.file_size_bytes = 0
+                state.pending_action = None
+                state.last_error = None
 
-            t = threading.Thread(target=self._monitor_capture, args=(band,), daemon=True)
-            t.start()
+            monitor = threading.Thread(
+                target=self._monitor_capture,
+                args=(normalized_band, session_id),
+                daemon=True,
+            )
+            monitor.start()
             self._broadcast()
-            return True, f"{band} capture started on {interface}"
-        except Exception as e:
-            return False, f"Error starting capture: {e}"
+            return True, f"{normalized_band} capture started on {interface}"
+        except Exception as exc:
+            self._mark_start_failed(normalized_band, str(exc))
+            return False, f"Error starting capture: {exc}"
+
+    def _mark_start_failed(self, band: str, error_message: str):
+        with self._status_lock:
+            state = self._status[band]
+            state.running = False
+            state.start_time = None
+            state.estimated_packets = 0
+            state.file_size_bytes = 0
+            state.pending_action = None
+            state.last_error = error_message
+            state.session_id = None
+            state.remote_pcap_path = None
+            state.remote_pid_path = None
+        self._broadcast()
 
     # ------------------------------------------------------------------
     # Stop
     # ------------------------------------------------------------------
 
-    def stop_capture(self, band: str) -> Tuple[bool, str, Optional[str]]:
+    def stop_capture(self, band: str) -> tuple[bool, str, Optional[str]]:
+        normalized_band = validate_band(band)
         with self._status_lock:
-            if not self._status[band]["running"]:
-                return False, f"{band} capture not running", None
+            state = self._status[normalized_band]
+            if state.pending_action == "starting":
+                return False, f"{normalized_band} capture is still starting", None
+            if state.pending_action == "stopping":
+                return False, f"{normalized_band} capture is already stopping", None
+            if not state.running or not state.session_id:
+                return False, f"{normalized_band} capture not running", None
+
+            session_id = state.session_id
+            state.pending_action = "stopping"
+            state.last_error = None
 
         try:
-            interface = self._iface_svc.interfaces.get(band)
-            if not interface:
-                return False, f"No interface for {band}", None
-
-            logger.info("Stopping tcpdump on %s (%s)", interface, band)
-            kill_cmd = (
-                f"PID=$(ps | grep 'tcpdump -i {interface}' | grep -v grep | awk '{{print $1}}');"
-                f' [ -n "$PID" ] && kill $PID 2>/dev/null || true'
+            paths = make_capture_paths(normalized_band, session_id)
+            logger.info("Stopping capture for %s (session=%s)", normalized_band, session_id)
+            stop_ok, stop_stdout, stop_stderr = run_ssh_command(
+                build_stop_capture_command(paths),
+                timeout=10,
             )
-            run_ssh_command(kill_cmd, timeout=10)
-            time.sleep(2)
+            if not stop_ok:
+                logger.warning(
+                    "Stop command for %s reported an SSH issue: %s",
+                    normalized_band,
+                    stop_stderr or stop_stdout,
+                )
 
+            time.sleep(1)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            ok, msg, path = self._downloader.download_pcap_files(band, timestamp)
-
-            with self._status_lock:
-                self._status[band]["running"] = False
-                self._status[band]["start_time"] = None
+            ok, msg, path = self._downloader.download_pcap_files(
+                normalized_band,
+                timestamp,
+                session_id,
+            )
+            self._clear_band_state(normalized_band)
             self._broadcast()
             return ok, msg, path
-        except Exception as e:
-            with self._status_lock:
-                self._status[band]["running"] = False
-                self._status[band]["start_time"] = None
-            return False, f"Error stopping capture: {e}", None
+        except Exception as exc:
+            self._clear_band_state(normalized_band, last_error=str(exc))
+            self._broadcast()
+            return False, f"Error stopping capture: {exc}", None
 
-    def stop_all_captures(self) -> Dict[str, Dict[str, Any]]:
-        """Stop every band, kill all tcpdump, download any pcap files."""
-        results: Dict[str, Dict[str, Any]] = {}
-
-        logger.info("stop_all: killing all tcpdump on OpenWrt")
-        ok, stdout, stderr = run_ssh_command(
-            "killall tcpdump 2>/dev/null; echo KILL_DONE", timeout=15,
-        )
-        if not ok or "KILL_DONE" not in stdout:
-            logger.error("stop_all: SSH failed – %s", stderr)
-            for b in ("2G", "5G", "6G"):
-                results[b] = {"success": False, "message": f"SSH error: {stderr or 'Cannot connect'}", "path": None}
-            return results
-
-        time.sleep(2)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
+    def stop_all_captures(self) -> dict[str, dict[str, Any]]:
+        """Stop all active sessions without touching unrelated tcpdump processes."""
+        results: dict[str, dict[str, Any]] = {}
         for band in ("2G", "5G", "6G"):
-            ok, msg, path = self._downloader.download_pcap_files(band, timestamp)
+            ok, msg, path = self.stop_capture(band)
             results[band] = {"success": ok, "message": msg, "path": path}
-            with self._status_lock:
-                self._status[band]["running"] = False
-                self._status[band]["start_time"] = None
-
-        self._broadcast()
         logger.info("stop_all completed: %s", results)
         return results
+
+    def _clear_band_state(self, band: str, last_error: Optional[str] = None):
+        with self._status_lock:
+            state = self._status[band]
+            state.running = False
+            state.start_time = None
+            state.estimated_packets = 0
+            state.file_size_bytes = 0
+            state.pending_action = None
+            state.last_error = last_error
+            state.session_id = None
+            state.remote_pcap_path = None
+            state.remote_pid_path = None
 
     # ------------------------------------------------------------------
     # Monitor
     # ------------------------------------------------------------------
 
-    def _monitor_capture(self, band: str):
-        while self._status[band]["running"]:
+    def _monitor_capture(self, band: str, session_id: str):
+        while True:
+            with self._status_lock:
+                state = self._status[band]
+                if (
+                    not state.running
+                    or state.session_id != session_id
+                    or state.pending_action == "stopping"
+                ):
+                    return
+
             try:
-                remote = f"/tmp/{band}.pcap"
-                ok, stdout, stderr = run_ssh_command(
-                    f"ls -la {remote} 2>/dev/null | awk '{{print $5}}'", timeout=8,
-                )
+                paths = make_capture_paths(band, session_id)
+                ok, stdout, stderr = run_ssh_command(build_capture_size_command(paths), timeout=8)
                 if ok and stdout.strip():
                     try:
                         size = int(stdout.strip())
+                    except ValueError:
+                        logger.debug("%s: unexpected size payload %r", band, stdout)
+                    else:
                         with self._status_lock:
-                            self._status[band]["packets"] = size // 100
+                            state = self._status[band]
+                            if state.session_id != session_id:
+                                return
+                            state.file_size_bytes = size
+                            # Preserve the existing UI behavior, but expose it as an estimate.
+                            state.estimated_packets = size // 100
                         self._monitor_error_count[band] = 0
                         self._monitor_last_error[band] = None
-                    except ValueError:
-                        pass
                 else:
                     self._monitor_error_count[band] += 1
                     self._monitor_last_error[band] = stderr or "SSH command failed"
                     if self._monitor_error_count[band] == MONITOR_ERROR_THRESHOLD:
                         logger.warning("%s: monitor SSH errors (%dx)", band, MONITOR_ERROR_THRESHOLD)
-            except Exception as e:
+            except Exception as exc:
                 self._monitor_error_count[band] += 1
-                self._monitor_last_error[band] = str(e)
+                self._monitor_last_error[band] = str(exc)
                 if self._monitor_error_count[band] == MONITOR_ERROR_THRESHOLD:
-                    logger.warning("%s: monitor exception (%dx): %s", band, MONITOR_ERROR_THRESHOLD, e)
+                    logger.warning("%s: monitor exception (%dx): %s", band, MONITOR_ERROR_THRESHOLD, exc)
+
             time.sleep(MONITOR_INTERVAL)

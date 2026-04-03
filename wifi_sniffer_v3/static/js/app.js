@@ -235,30 +235,41 @@ function updateStatusDisplay(data) {
         const statusEl = document.getElementById('status-' + bandLower);
         const durationEl = document.getElementById('duration-' + bandLower);
         const packetsEl = document.getElementById('packets-' + bandLower);
+        const captureState = info.state || (info.running ? 'running' : 'idle');
+        const estimatedPackets = info.estimated_packets ?? info.packets ?? 0;
 
         if (statusEl) {
-            statusEl.textContent = info.running ? 'CAPTURING' : 'IDLE';
+            const label = captureState === 'starting'
+                ? 'STARTING'
+                : captureState === 'stopping'
+                    ? 'STOPPING'
+                    : info.running
+                        ? 'CAPTURING'
+                        : 'IDLE';
+            statusEl.textContent = label;
             statusEl.className = 'status-badge ' + (info.running ? 'status-running' : 'status-idle');
         }
         if (durationEl) durationEl.textContent = info.duration || '--:--';
-        if (packetsEl) packetsEl.textContent = info.packets || 0;
+        if (packetsEl) packetsEl.textContent = estimatedPackets;
 
-        updateCaptureButtons(band, info.running);
+        updateCaptureButtons(band, captureState);
     }
 }
 
-function updateCaptureButtons(band, running) {
+function updateCaptureButtons(band, captureState) {
     const bandLower = band.toLowerCase();
     const startBtn = document.querySelector('.card-' + bandLower + ' .btn-start');
     const stopBtn = document.querySelector('.card-' + bandLower + ' .btn-stop');
+    const isRunning = captureState === 'running';
+    const isBusy = captureState === 'starting' || captureState === 'stopping';
 
     if (startBtn) {
-        startBtn.disabled = running;
-        startBtn.classList.toggle('btn-disabled', running);
+        startBtn.disabled = isRunning || isBusy;
+        startBtn.classList.toggle('btn-disabled', isRunning || isBusy);
     }
     if (stopBtn) {
-        stopBtn.disabled = !running;
-        stopBtn.classList.toggle('btn-disabled', !running);
+        stopBtn.disabled = !isRunning || isBusy;
+        stopBtn.classList.toggle('btn-disabled', !isRunning || isBusy);
     }
 }
 
@@ -326,6 +337,8 @@ async function stopAll() {
         for (const [band, result] of resultEntries) {
             if (result.success && result.path) {
                 savedBands.push(band);
+            } else if (result.message && result.message.includes('capture not running')) {
+                noFileBands.push(band);
             } else if (result.message && result.message.includes('No capture file')) {
                 noFileBands.push(band);
             } else {
@@ -608,10 +621,11 @@ async function diagnoseConnection() {
 
         const pwStatus = data.password_set
             ? '<span class="diagnose-value--ok">Yes</span>'
-            : '<span class="diagnose-value--fail">No</span>';
+            : '<span class="diagnose-value--neutral">No</span>';
         const keysStatus = data.ssh_keys_found && data.ssh_keys_found.length > 0
             ? '<span class="diagnose-value--ok">' + data.ssh_keys_found.join(', ') + '</span>'
             : '<span class="diagnose-value--neutral">None</span>';
+        const authMode = data.auth_mode || 'publickey';
         const pingStatus = data.ping_test
             ? '<span class="diagnose-value--ok">\u2713 OK</span>'
             : '<span class="diagnose-value--fail">\u2717 Failed</span>';
@@ -625,7 +639,8 @@ async function diagnoseConnection() {
         const statusHtml = '<div class="diagnose-info-block">' +
             '<div class="diagnose-info-row"><strong>Host:</strong> ' + data.host + ':' + data.port + '</div>' +
             '<div class="diagnose-info-row"><strong>User:</strong> ' + data.user + '</div>' +
-            '<div class="diagnose-info-row"><strong>Password Set:</strong> ' + pwStatus + '</div>' +
+            '<div class="diagnose-info-row"><strong>Auth Mode:</strong> ' + authMode + '</div>' +
+            '<div class="diagnose-info-row"><strong>Password Configured:</strong> ' + pwStatus + '</div>' +
             '<div class="diagnose-info-row"><strong>SSH Keys Found:</strong> ' + keysStatus + '</div>' +
             '<div class="diagnose-info-row"><strong>Ping Test:</strong> ' + pingStatus + '</div>' +
             '<div class="diagnose-info-row"><strong>SSH Test:</strong> ' + sshStatus + '</div>' +

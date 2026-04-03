@@ -5,19 +5,17 @@ Reusable SSH client for executing commands on OpenWrt.
 Uses Windows OpenSSH subprocess under the hood.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import shutil
 import subprocess
-import sys
 import threading
-from typing import Optional, Tuple
+from typing import Optional
 
-from ..config import (
-    OPENWRT_HOST, OPENWRT_USER,
-    SSH_KEY_PATH, SSH_PORT,
-    SSH_CONNECT_TIMEOUT, SSH_COMMAND_TIMEOUT,
-)
+from ..config import CONFIG
+from ..remote import shell_quote
 from ..utils import get_subprocess_startupinfo
 
 logger = logging.getLogger(__name__)
@@ -59,7 +57,7 @@ class SSHClient:
         self._detect_pubkey_option()
 
         self._initialized = True
-        logger.info("SSHClient initialised – ssh=%s", self._ssh_exe)
+        logger.info("SSHClient initialised, ssh=%s", self._ssh_exe)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -96,7 +94,9 @@ class SSHClient:
             try:
                 probe = subprocess.run(
                     [self._ssh_exe, "-G", "-o", f"{opt}=+ssh-rsa", "dummy"],
-                    capture_output=True, text=True, timeout=5,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
                     startupinfo=self._startupinfo,
                 )
                 if probe.returncode == 0:
@@ -107,45 +107,50 @@ class SSHClient:
 
         self._pubkey_option = None
 
-    def _build_ssh_args(self, timeout: Optional[int] = None,
-                        batch_mode: bool = False) -> list:
+    def _build_ssh_args(self, timeout: Optional[int] = None, batch_mode: bool = False) -> list[str]:
         args = [
             self._ssh_exe,
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "HostKeyAlgorithms=+ssh-rsa",
-            "-o", "PreferredAuthentications=publickey",
-            "-o", "PubkeyAuthentication=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "HostKeyAlgorithms=+ssh-rsa",
+            "-o",
+            "PreferredAuthentications=publickey",
+            "-o",
+            "PubkeyAuthentication=yes",
         ]
+        if self._pubkey_option:
+            args += ["-o", f"{self._pubkey_option}=+ssh-rsa"]
         if timeout is not None:
             args += ["-o", f"ConnectTimeout={timeout}"]
         if batch_mode:
             args += ["-o", "BatchMode=yes"]
-        if SSH_PORT != 22:
-            args += ["-p", str(SSH_PORT)]
-        if SSH_KEY_PATH:
-            args += ["-i", SSH_KEY_PATH]
-        args.append(f"{OPENWRT_USER}@{OPENWRT_HOST}")
+        if CONFIG.ssh_port != 22:
+            args += ["-p", str(CONFIG.ssh_port)]
+        if CONFIG.ssh_key_path:
+            args += ["-i", CONFIG.ssh_key_path]
+        args.append(f"{CONFIG.openwrt_user}@{CONFIG.openwrt_host}")
         return args
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def execute(self, command: str,
-                timeout: int = SSH_COMMAND_TIMEOUT) -> Tuple[bool, str, str]:
+    def execute(self, command: str, timeout: int = CONFIG.ssh_command_timeout) -> tuple[bool, str, str]:
         """
         Execute *command* on the remote host.
 
         Returns ``(success, stdout, stderr)``.
         """
-        ssh_cmd = self._build_ssh_args(timeout=SSH_CONNECT_TIMEOUT)
+        ssh_cmd = self._build_ssh_args(timeout=CONFIG.ssh_connect_timeout)
         ssh_cmd.append(command)
 
         with self._command_lock:
             try:
                 result = subprocess.run(
                     ssh_cmd,
-                    capture_output=True, text=True,
+                    capture_output=True,
+                    text=True,
                     timeout=timeout + 5,
                     startupinfo=self._startupinfo,
                 )
@@ -153,13 +158,13 @@ class SSHClient:
                 return ok, result.stdout, result.stderr
             except subprocess.TimeoutExpired:
                 return False, "", "Command timeout"
-            except Exception as e:
-                logger.debug("SSH execute error: %s", e)
-                return False, "", str(e)
+            except Exception as exc:
+                logger.debug("SSH execute error: %s", exc)
+                return False, "", str(exc)
 
     def execute_background(self, command: str) -> Optional[subprocess.Popen]:
-        """Start *command* as a background process; return the Popen handle."""
-        ssh_cmd = self._build_ssh_args(timeout=SSH_CONNECT_TIMEOUT)
+        """Start *command* as a background process and return the Popen handle."""
+        ssh_cmd = self._build_ssh_args(timeout=CONFIG.ssh_connect_timeout)
         ssh_cmd.append(command)
         try:
             return subprocess.Popen(
@@ -169,8 +174,8 @@ class SSHClient:
                 stdin=subprocess.DEVNULL,
                 startupinfo=self._startupinfo,
             )
-        except Exception as e:
-            logger.error("Failed to start background SSH command: %s", e)
+        except Exception as exc:
+            logger.error("Failed to start background SSH command: %s", exc)
             return None
 
     def download_via_cat(self, remote_path: str, local_path: str) -> bool:
@@ -179,15 +184,15 @@ class SSHClient:
 
         Returns ``True`` when the file is written locally with size > 0.
         """
-        ssh_cmd = self._build_ssh_args(timeout=SSH_CONNECT_TIMEOUT)
-        ssh_cmd.append(f"cat {remote_path}")
+        ssh_cmd = self._build_ssh_args(timeout=CONFIG.ssh_connect_timeout)
+        ssh_cmd.append(f"cat {shell_quote(remote_path)}")
 
         try:
             logger.info("Downloading %s -> %s", remote_path, local_path)
-            with open(local_path, "wb") as fh:
+            with open(local_path, "wb") as handle:
                 result = subprocess.run(
                     ssh_cmd,
-                    stdout=fh,
+                    stdout=handle,
                     stderr=subprocess.PIPE,
                     stdin=subprocess.DEVNULL,
                     timeout=120,
@@ -202,8 +207,8 @@ class SSHClient:
             stderr_msg = result.stderr.decode() if result.stderr else "Unknown error"
             logger.warning("Download failed: %s", stderr_msg)
             return False
-        except Exception as e:
-            logger.error("Download error: %s", e)
+        except Exception as exc:
+            logger.error("Download error: %s", exc)
             return False
 
     def test_connection(self) -> bool:

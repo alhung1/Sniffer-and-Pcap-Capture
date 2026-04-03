@@ -11,6 +11,7 @@ build/build/
 build/dist/
 build/output/
 *.spec
+!build/wifi_sniffer_v3.spec
 
 # Virtual environment
 venv/
@@ -18,6 +19,3 @@ venv/
 
 # Debug session logs
 debug_session/
-
-# Test files
-tests/
