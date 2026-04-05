@@ -2,40 +2,25 @@
 API Routes
 ==========
 REST endpoints for the WiFi Sniffer v3 application.
+All POST endpoints validate JSON input.
 """
-
-from __future__ import annotations
 
 import logging
 import subprocess
 from pathlib import Path
-from typing import Any, Optional
 
 from flask import current_app, jsonify, request
 
 from . import api_bp
-from .. import is_startup_cleanup_done, perform_startup_cleanup
-from ..cache import (
-    ConnectionStatusPayload,
-    get_cached_connection_status,
-    set_cached_connection_status,
-)
 from ..config import (
-    BANDWIDTHS,
-    CHANNELS,
-    OPENWRT_HOST,
-    OPENWRT_PASSWORD,
-    OPENWRT_USER,
-    SSH_KEY_PATH,
-    SSH_PORT,
+    OPENWRT_HOST, OPENWRT_USER, OPENWRT_PASSWORD,
+    SSH_KEY_PATH, SSH_PORT, CHANNELS, BANDWIDTHS,
 )
-from ..remote import RemoteCommandError, validate_band
+from ..cache import get_cached_connection_status, set_cached_connection_status
 from ..utils import get_subprocess_startupinfo
+from .. import perform_startup_cleanup, is_startup_cleanup_done
 
 logger = logging.getLogger(__name__)
-
-_TRUE_VALUES = {"1", "true", "yes", "on"}
-_FALSE_VALUES = {"0", "false", "no", "off"}
 
 
 def _svc():
@@ -49,74 +34,9 @@ def _svc():
     )
 
 
-def _json_error(message: str, status_code: int = 400, **extra):
-    payload = {"success": False, "message": message}
-    payload.update(extra)
-    return jsonify(payload), status_code
-
-
-def _get_json_body() -> tuple[Optional[dict[str, Any]], Optional[tuple[Any, int]]]:
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        return None, _json_error("Invalid JSON body")
-    return data, None
-
-
-def _normalize_band_or_error(band: str, interfaces: dict[str, str]):
-    try:
-        normalized_band = validate_band(band)
-    except RemoteCommandError as exc:
-        return None, _json_error(str(exc))
-
-    if normalized_band not in interfaces:
-        return None, _json_error(f"Invalid band: {normalized_band}")
-    return normalized_band, None
-
-
-def _parse_int_field(
-    data: dict[str, Any],
-    field_name: str,
-    *,
-    default: Optional[int] = None,
-    minimum: Optional[int] = None,
-    maximum: Optional[int] = None,
-):
-    if field_name not in data:
-        return default, None
-
-    raw_value = data[field_name]
-    try:
-        value = int(raw_value)
-    except (TypeError, ValueError):
-        return None, _json_error(f"{field_name} must be an integer")
-
-    if minimum is not None and value < minimum:
-        return None, _json_error(f"{field_name} must be at least {minimum}")
-    if maximum is not None and value > maximum:
-        return None, _json_error(f"{field_name} must be at most {maximum}")
-    return value, None
-
-
-def _parse_bool_field(data: dict[str, Any], field_name: str):
-    if field_name not in data:
-        return None, None
-
-    raw_value = data[field_name]
-    if isinstance(raw_value, bool):
-        return raw_value, None
-    if isinstance(raw_value, str):
-        normalized = raw_value.strip().lower()
-        if normalized in _TRUE_VALUES:
-            return True, None
-        if normalized in _FALSE_VALUES:
-            return False, None
-    return None, _json_error(f"{field_name} must be a boolean")
-
-
 # ------------------------------------------------------------------
 # Status
 # ------------------------------------------------------------------
-
 
 @api_bp.route("/status")
 def get_status():
@@ -128,13 +48,12 @@ def get_status():
 # Capture controls
 # ------------------------------------------------------------------
 
-
 @api_bp.route("/start/<band>", methods=["POST"])
 def api_start(band):
     cap, iface_svc, *_ = _svc()
-    band, error = _normalize_band_or_error(band, iface_svc.interfaces)
-    if error:
-        return error
+    band = band.upper()
+    if band not in iface_svc.interfaces:
+        return jsonify({"success": False, "message": f"Invalid band: {band}"}), 400
     ok, msg = cap.start_capture(band)
     return jsonify({"success": ok, "message": msg})
 
@@ -142,9 +61,9 @@ def api_start(band):
 @api_bp.route("/stop/<band>", methods=["POST"])
 def api_stop(band):
     cap, iface_svc, *_ = _svc()
-    band, error = _normalize_band_or_error(band, iface_svc.interfaces)
-    if error:
-        return error
+    band = band.upper()
+    if band not in iface_svc.interfaces:
+        return jsonify({"success": False, "message": f"Invalid band: {band}"}), 400
     ok, msg, path = cap.stop_capture(band)
     return jsonify({"success": ok, "message": msg, "path": path})
 
@@ -169,29 +88,19 @@ def api_stop_all():
 # Channel configuration
 # ------------------------------------------------------------------
 
-
 @api_bp.route("/config/<band>", methods=["POST"])
 def api_config(band):
     _, iface_svc, __, wifi_svc = _svc()
-    band, error = _normalize_band_or_error(band, iface_svc.interfaces)
-    if error:
-        return error
+    band = band.upper()
+    if band not in iface_svc.interfaces:
+        return jsonify({"success": False, "message": f"Invalid band: {band}"}), 400
 
-    data, error = _get_json_body()
-    if error:
-        return error
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"success": False, "message": "Invalid JSON body"}), 400
 
-    default_channel = wifi_svc.channel_config[band]["channel"]
-    channel, error = _parse_int_field(data, "channel", default=default_channel)
-    if error:
-        return error
-    if channel not in CHANNELS[band]:
-        return _json_error(f"Invalid channel for {band}: {channel}")
-
+    channel = int(data.get("channel", wifi_svc.channel_config[band]["channel"]))
     bandwidth = data.get("bandwidth", wifi_svc.channel_config[band]["bandwidth"])
-    if bandwidth not in BANDWIDTHS[band]:
-        return _json_error(f"Invalid bandwidth for {band}: {bandwidth}")
-
     ok, msg = wifi_svc.set_channel_config(band, channel, bandwidth)
     return jsonify({"success": ok, "message": msg})
 
@@ -201,13 +110,11 @@ def api_apply_config():
     cap, _, __, wifi_svc = _svc()
     status = cap.get_all_status()
     for band in ("2G", "5G", "6G"):
-        if status[band]["running"] or status[band]["pending_action"]:
-            return jsonify(
-                {
-                    "success": False,
-                    "message": f"Cannot apply config while {band} capture is active. Stop all captures first.",
-                }
-            )
+        if status[band]["running"]:
+            return jsonify({
+                "success": False,
+                "message": f"Cannot apply config while {band} capture is running. Stop all captures first.",
+            })
 
     results = wifi_svc.apply_all_and_restart_wifi()
     if "method" not in results:
@@ -226,7 +133,6 @@ def api_get_wifi_config():
 # Connection
 # ------------------------------------------------------------------
 
-
 @api_bp.route("/test_connection")
 def api_test_connection():
     cap, iface_svc, _, wifi_svc = _svc()
@@ -243,12 +149,12 @@ def api_test_connection():
             iface_svc.detect_interfaces()
             wifi_svc.sync_channel_config_from_openwrt()
 
-    result: ConnectionStatusPayload = {
+    result = {
         "connected": connected,
         "host": OPENWRT_HOST,
         "port": SSH_PORT,
         "user": OPENWRT_USER,
-        "auth_method": "publickey" if SSH_KEY_PATH else "default_key_lookup",
+        "auth_method": "key" if SSH_KEY_PATH else ("password" if OPENWRT_PASSWORD else "default"),
         "error": cap.last_connection_error if not connected else None,
     }
     set_cached_connection_status(result)
@@ -261,15 +167,14 @@ def api_diagnose():
     from ..ssh import ssh_client
 
     ssh_dir = Path.home() / ".ssh"
-    ssh_keys = [key for key in ("id_rsa", "id_ed25519", "id_ecdsa", "id_dsa") if (ssh_dir / key).exists()]
+    ssh_keys = [k for k in ("id_rsa", "id_ed25519", "id_ecdsa", "id_dsa") if (ssh_dir / k).exists()]
 
     results = {
         "host": OPENWRT_HOST,
         "port": SSH_PORT,
         "user": OPENWRT_USER,
         "password_set": bool(OPENWRT_PASSWORD),
-        "password_supported": False,
-        "auth_mode": "publickey",
+        "no_password_mode": not OPENWRT_PASSWORD,
         "key_path": SSH_KEY_PATH,
         "ssh_keys_found": ssh_keys,
         "has_ssh_key": len(ssh_keys) > 0,
@@ -279,17 +184,15 @@ def api_diagnose():
         "solution": None,
     }
 
-    startupinfo = get_subprocess_startupinfo()
+    si = get_subprocess_startupinfo()
     try:
         ping = subprocess.run(
             ["ping", "-n", "1", "-w", "2000", OPENWRT_HOST],
-            capture_output=True,
-            timeout=5,
-            startupinfo=startupinfo,
+            capture_output=True, timeout=5, startupinfo=si,
         )
         results["ping_test"] = ping.returncode == 0
-    except Exception as exc:
-        results["ping_error"] = str(exc)
+    except Exception as e:
+        results["ping_error"] = str(e)
 
     results["ssh_test"] = ssh_client.test_connection()
     results["error"] = cap.last_connection_error
@@ -317,15 +220,13 @@ def api_diagnose():
 # Time
 # ------------------------------------------------------------------
 
-
 @api_bp.route("/time_info")
 def api_time_info():
     _, __, time_svc, ___ = _svc()
     info = time_svc.get_time_info()
     info["last_sync"] = (
         time_svc.status["last_sync"].strftime("%Y-%m-%d %H:%M:%S")
-        if time_svc.status.get("last_sync")
-        else None
+        if time_svc.status.get("last_sync") else None
     )
     return jsonify(info)
 
@@ -341,71 +242,55 @@ def api_sync_time():
 # File split
 # ------------------------------------------------------------------
 
-
 @api_bp.route("/file_split", methods=["GET"])
 def api_get_file_split():
     cap, *_ = _svc()
-    return jsonify(
-        {
-            "enabled": cap.file_split_config["enabled"],
-            "size_mb": cap.file_split_config["size_mb"],
-        }
-    )
+    return jsonify({
+        "enabled": cap.file_split_config["enabled"],
+        "size_mb": cap.file_split_config["size_mb"],
+    })
 
 
 @api_bp.route("/file_split", methods=["POST"])
 def api_set_file_split():
     cap, *_ = _svc()
-    data, error = _get_json_body()
-    if error:
-        return error
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"success": False, "message": "Invalid JSON body"}), 400
 
-    enabled, error = _parse_bool_field(data, "enabled")
-    if error:
-        return error
-
-    size_mb, error = _parse_int_field(data, "size_mb", minimum=10, maximum=2000)
-    if error:
-        return error
-
-    if enabled is not None:
-        cap.file_split_config["enabled"] = enabled
-    if size_mb is not None:
-        cap.file_split_config["size_mb"] = size_mb
+    if "enabled" in data:
+        cap.file_split_config["enabled"] = bool(data["enabled"])
+    if "size_mb" in data:
+        size = max(10, min(2000, int(data["size_mb"])))
+        cap.file_split_config["size_mb"] = size
 
     enabled = cap.file_split_config["enabled"]
     size_mb = cap.file_split_config["size_mb"]
-    message = f"File split {'enabled' if enabled else 'disabled'}"
+    msg = f"File split {'enabled' if enabled else 'disabled'}"
     if enabled:
-        message += f" ({size_mb}MB per file)"
+        msg += f" ({size_mb}MB per file)"
 
-    return jsonify({"success": True, "enabled": enabled, "size_mb": size_mb, "message": message})
+    return jsonify({"success": True, "enabled": enabled, "size_mb": size_mb, "message": msg})
 
 
 # ------------------------------------------------------------------
 # Interfaces
 # ------------------------------------------------------------------
 
-
 @api_bp.route("/interface_mapping")
 def api_get_interface_mapping():
-    _, iface_svc, __, wifi_svc = _svc()
+    _, iface_svc, *__ = _svc()
     det = iface_svc.detection_status
-    return jsonify(
-        {
-            "interfaces": iface_svc.interfaces,
-            "uci_wifi_map": iface_svc.uci_wifi_map,
-            "channel_config": wifi_svc.get_channel_config(),
-            "detection_status": {
-                "detected": det["detected"],
-                "last_detection": det["last_detection"].strftime("%Y-%m-%d %H:%M:%S")
-                if det.get("last_detection")
-                else None,
-                "detection_method": det.get("detection_method"),
-                "detected_mapping": det.get("detected_mapping"),
-            },
-        }
-    )
+    return jsonify({
+        "interfaces": iface_svc.interfaces,
+        "uci_wifi_map": iface_svc.uci_wifi_map,
+        "detection_status": {
+            "detected": det["detected"],
+            "last_detection": det["last_detection"].strftime("%Y-%m-%d %H:%M:%S") if det.get("last_detection") else None,
+            "detection_method": det.get("detection_method"),
+            "detected_mapping": det.get("detected_mapping"),
+        },
+    })
 
 
 @api_bp.route("/detect_interfaces", methods=["POST"])
@@ -417,24 +302,19 @@ def api_detect_interfaces():
         wifi_svc.sync_channel_config_from_openwrt()
 
     det = iface_svc.detection_status
-    return jsonify(
-        {
-            "success": ok,
-            "interfaces": iface_svc.interfaces,
-            "uci_wifi_map": iface_svc.uci_wifi_map,
-            "channel_config": wifi_svc.get_channel_config(),
-            "detection_status": {
-                "detected": det["detected"],
-                "last_detection": det["last_detection"].strftime("%Y-%m-%d %H:%M:%S")
-                if det.get("last_detection")
-                else None,
-                "detection_method": det.get("detection_method"),
-            },
-            "message": (
-                f"Detection {'successful' if ok else 'failed'}. "
-                f"Mapping: 2G={iface_svc.interfaces.get('2G')}, "
-                f"5G={iface_svc.interfaces.get('5G')}, "
-                f"6G={iface_svc.interfaces.get('6G')}"
-            ),
-        }
-    )
+    return jsonify({
+        "success": ok,
+        "interfaces": iface_svc.interfaces,
+        "uci_wifi_map": iface_svc.uci_wifi_map,
+        "detection_status": {
+            "detected": det["detected"],
+            "last_detection": det["last_detection"].strftime("%Y-%m-%d %H:%M:%S") if det.get("last_detection") else None,
+            "detection_method": det.get("detection_method"),
+        },
+        "message": (
+            f"Detection {'successful' if ok else 'failed'}. "
+            f"Mapping: 2G={iface_svc.interfaces.get('2G')}, "
+            f"5G={iface_svc.interfaces.get('5G')}, "
+            f"6G={iface_svc.interfaces.get('6G')}"
+        ),
+    })
