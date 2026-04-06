@@ -6,7 +6,7 @@ setlocal EnableDelayedExpansion
 echo.
 echo ============================================================
 echo     WiFi Sniffer Web Control Panel - Installation
-echo     Supports v1 (Classic) and v2 (Performance)
+echo     Supports v1 / v2 / v3 / v4 (Latest)
 echo ============================================================
 echo.
 
@@ -19,7 +19,7 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 REM ========== Check Python ==========
-echo [1/6] Checking Python installation...
+echo [1/7] Checking Python installation...
 where python >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
     echo [ERROR] Python is NOT installed!
@@ -40,7 +40,7 @@ if %ERRORLEVEL% NEQ 0 (
 
 REM ========== Check pip ==========
 echo.
-echo [2/6] Checking pip installation...
+echo [2/7] Checking pip installation...
 python -m pip --version >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
     echo [INFO] Installing pip...
@@ -51,44 +51,45 @@ if %ERRORLEVEL% NEQ 0 (
 
 REM ========== Upgrade pip ==========
 echo.
-echo [3/6] Upgrading pip to latest version...
+echo [3/7] Upgrading pip to latest version...
 python -m pip install --upgrade pip --quiet
 
-REM ========== Install Core Dependencies ==========
+REM ========== Check SSH ==========
 echo.
-echo [4/6] Installing core Python dependencies...
-echo      - Flask (Web framework)
-echo      - Paramiko (SSH library)
-echo.
-
-python -m pip install flask paramiko --quiet
+echo [4/7] Checking OpenSSH availability...
+where ssh >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
-    echo [ERROR] Failed to install core dependencies!
-    echo Please try running: pip install flask paramiko
-    pause
-    exit /b 1
+    echo [WARN] OpenSSH is NOT found in PATH!
+    echo [INFO] v4 requires native Windows OpenSSH (no paramiko).
+    echo [INFO] Install via: Settings -^> Apps -^> Optional Features -^> Add OpenSSH Client
+    echo.
+) else (
+    for /f "tokens=*" %%i in ('ssh -V 2^>^&1') do set SSHVER=%%i
+    echo [OK] !SSHVER!
 )
-echo [OK] Core dependencies installed
 
-REM ========== Install v2 Dependencies ==========
+REM ========== Install v4 Dependencies ==========
 echo.
-echo [5/6] Installing v2 dependencies (WebSocket support)...
+echo [5/7] Installing v4 dependencies...
+echo      - Flask (Web framework)
 echo      - Flask-SocketIO (Real-time updates)
 echo      - Eventlet (Async support)
 echo.
+echo      NOTE: v4 does NOT require paramiko (uses native SSH)
+echo.
 
-python -m pip install flask-socketio eventlet --quiet
+python -m pip install flask flask-socketio eventlet --quiet
 if %ERRORLEVEL% NEQ 0 (
-    echo [WARN] Failed to install v2 dependencies.
-    echo [WARN] v1 will work, but v2 requires these packages.
-    echo [INFO] Try manually: pip install flask-socketio eventlet
-) else (
-    echo [OK] v2 dependencies installed
+    echo [ERROR] Failed to install dependencies!
+    echo Please try running: pip install flask flask-socketio eventlet
+    pause
+    exit /b 1
 )
+echo [OK] v4 dependencies installed
 
 REM ========== Check Wireshark ==========
 echo.
-echo [6/6] Checking Wireshark installation...
+echo [6/7] Checking Wireshark installation...
 where wireshark >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
     echo [WARN] Wireshark is NOT found in PATH
@@ -109,16 +110,18 @@ echo ============================================================
 echo     SSH Configuration for OpenWrt (192.168.1.1)
 echo ============================================================
 echo.
-echo The system uses Windows native SSH which works automatically
-echo with OpenWrt's default configuration (no password).
+echo v4 uses Windows native SSH which works automatically
+echo with OpenWrt's default configuration (publickey auth).
 echo.
-echo If your OpenWrt requires a password:
-echo   Option 1: Set up SSH key authentication (recommended)
-echo   Option 2: Edit wifi_sniffer/config.py and set OPENWRT_PASSWORD
+echo If SSH fails, ensure:
+echo   1. OpenSSH Client is installed (Windows Optional Features)
+echo   2. SSH key is set up: ssh-keygen -t rsa
+echo   3. Key is copied to router: ssh root@192.168.1.1
 echo.
 
 REM ========== Test Connection ==========
 echo.
+echo [7/7] Testing SSH connection...
 set /p TEST_SSH="Test SSH connection to 192.168.1.1? (Y/N): "
 if /i "%TEST_SSH%"=="Y" (
     echo.
@@ -143,17 +146,22 @@ echo ============================================================
 echo.
 echo Available versions:
 echo.
-echo   v1 (Classic):
-echo      - Run: start_server.bat
-echo      - Or:  python wifi_sniffer_web_control.py
+echo   v4 (Latest - Recommended):
+echo      - Run: start_server_v4.bat
+echo      - Or:  python wifi_sniffer_web_control_v4.py
+echo      - Features: No paramiko, semaphore SSH, persistent config,
+echo                   real file-size monitoring, input validation
 echo.
-echo   v2 (Performance - Recommended):
+echo   v3 (Service Architecture):
+echo      - Run: start_server_v3.bat
+echo      - Or:  python wifi_sniffer_web_control_v3.py
+echo.
+echo   v2 (Performance):
 echo      - Run: start_server_v2.bat
 echo      - Or:  python wifi_sniffer_web_control_v2.py
-echo      - Features: SSH pooling, WebSocket, Caching
 echo.
 echo   Standalone EXE (No Python needed):
-echo      - v1: build\dist\WiFi_Sniffer_Control_Panel.exe
+echo      - v4: build\dist\WiFi_Sniffer_Control_Panel_v4.exe
 echo      - v2: build\dist\WiFi_Sniffer_Control_Panel_v2.exe
 echo.
 echo Files saved to: %USERPROFILE%\Downloads

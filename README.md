@@ -2,7 +2,7 @@
 
 Web-based control panel for WiFi packet capture using OpenWrt Monitor Mode. Supports simultaneous or individual capture of 2.4G / 5G / 6G bands.
 
-**Version:** 2.2 | **Last Updated:** 2026-01-28
+**Version:** 4.0 | **Last Updated:** 2026-04-05
 
 ---
 
@@ -13,32 +13,42 @@ For deploying on a new computer, follow these steps:
 | Step | Action | Verification |
 |------|--------|--------------|
 | 1 | Install Python 3.8+ (check "Add to PATH") | `python --version` |
-| 2 | Connect PC to OpenWrt network | Ping 192.168.1.1 |
-| 3 | Double-click `install.bat` | All [OK] messages |
-| 4 | Double-click `start_server_v2.bat` | Browser opens |
-| 5 | Check header shows 🟢 Connected | Green dot |
-| 6 | Check time shows ✓ Synced | Green badge |
+| 2 | Verify OpenSSH installed | `ssh -V` |
+| 3 | Connect PC to OpenWrt network | Ping 192.168.1.1 |
+| 4 | Double-click `install.bat` | All [OK] messages |
+| 5 | Double-click `start_server_v4.bat` | Browser opens |
+| 6 | Check header shows 🟢 Connected | Green dot |
+| 7 | Check time shows ✓ Synced | Green badge |
 
-> **v2.0:** Major performance improvements! SSH connection pooling, WebSocket real-time updates, and async page loading for faster response on Windows 10/11.
+> **v4.0:** Major quality release! No paramiko dependency (native OpenSSH only), semaphore-based SSH concurrency, persistent config, real file-size monitoring, input validation, shell injection prevention, XSS protection.
 
 ---
 
-## 🆕 What's New in v2.0
+## 🆕 What's New in v4.0
 
-| Feature | v1 (Classic) | v2 (Performance) |
-|---------|--------------|------------------|
-| Page Load | 3-5 seconds | < 500ms |
-| SSH Commands | New connection each time | Connection pooling |
-| Status Updates | 5 sec polling | WebSocket (instant) |
-| Interface Detection | 5-10 seconds | 2-3 seconds (cached) |
-| Architecture | Single file (2600 lines) | Modular (10+ files) |
+| Feature | v2 | v3 | v4 |
+|---------|-----|-----|-----|
+| SSH Library | paramiko + native | native SSH | native SSH |
+| SSH Concurrency | Mutex (1 at a time) | Mutex (1 at a time) | Semaphore (4 concurrent) |
+| Packet Display | Fake count (size/100) | Fake count | Real file size (bytes) |
+| Config Persistence | None (lost on restart) | None | JSON (~/.wifi_sniffer/) |
+| Input Validation | None | Basic | Full (channel, band, type) |
+| Security | Hardcoded SECRET_KEY | Random SECRET_KEY | Random + shell injection prevention + XSS protection |
+| Default Binding | 0.0.0.0 (all interfaces) | 0.0.0.0 | 127.0.0.1 (localhost only) |
+| Architecture | Modular (10+ files) | Service-oriented (5 services) | Service-oriented + quality fixes |
 
-### v2 Performance Features
-- **SSH Connection Pool** - Reuses connections, caches SSH executable path
-- **WebSocket Real-time Updates** - No more polling, instant status changes
-- **Caching Layer** - Connection status, interface mapping cached
-- **Async Page Load** - Page renders immediately, data loads in background
-- **Modular Architecture** - Easier to maintain and extend
+### v4 Key Improvements
+- **No paramiko dependency** — Uses native Windows OpenSSH only, fewer install issues
+- **Semaphore-based SSH** — 4 concurrent SSH commands instead of mutex serialization
+- **Real file-size monitoring** — Shows actual pcap size (KB/MB/GB), not fake packet count
+- **Persistent config** — Channel settings and file-split config survive restarts
+- **Thread-safe config** — Atomic file writes with lock protection
+- **Input validation** — All API endpoints validate band, channel, bandwidth, types
+- **Shell injection prevention** — Interface names sanitized before SSH command injection
+- **XSS protection** — Frontend escapes all API data before innerHTML insertion
+- **Auto-create Downloads dir** — No more crash if ~/Downloads doesn't exist
+- **Smarter stop_all** — Only downloads bands that were actually running
+- **Monitor broadcasts** — WebSocket clients get real-time file size updates during capture
 
 ---
 
@@ -47,9 +57,10 @@ For deploying on a new computer, follow these steps:
 | Software | Purpose | Required |
 |----------|---------|----------|
 | Python 3.8+ | Run main application | ✅ Required |
+| Windows OpenSSH | SSH to OpenWrt (v4 requires this) | ✅ Required |
 | OpenWrt Router | Sniffer capture (192.168.1.1) | ✅ Required |
 | Wireshark | View .pcap files | ⭐ Recommended |
-| Tera Term | SSH connection for frequency config | ⭐ Recommended |
+| Tera Term | SSH connection for frequency config | ⭐ Optional |
 
 ### OpenWrt Requirements
 - IP Address: `192.168.1.1`
@@ -76,11 +87,13 @@ For deploying on a new computer, follow these steps:
 Double-click **`install.bat`**, the script will automatically:
 1. Check if Python is installed
 2. Install and upgrade pip to latest version
-3. Install required Python packages:
-   - Flask, Paramiko (core)
-   - Flask-SocketIO, Eventlet (v2 WebSocket support)
-4. Check if Wireshark is installed
-5. Provide SSH connection test
+3. Check OpenSSH availability (required for v4)
+4. Install required Python packages:
+   - Flask (core)
+   - Flask-SocketIO, Eventlet (WebSocket support)
+   - Note: **paramiko is NOT required for v4**
+5. Check if Wireshark is installed
+6. Provide SSH connection test
 
 > **Note**: Windows 10/11 includes OpenSSH by default. If SSH is not available, enable it via:
 > Settings → Apps → Optional Features → Add OpenSSH Client
@@ -104,27 +117,26 @@ If your OpenWrt requires a password, you can either:
 
 ## 🚀 Quick Start
 
-### Method 1: v2 One-Click Launch (Recommended)
+### Method 1: v4 One-Click Launch (Recommended)
 
-Double-click **`start_server_v2.bat`**, the script will:
-1. Automatically check Python environment
-2. Install required dependencies
+Double-click **`start_server_v4.bat`**, the script will:
+1. Check Python and OpenSSH availability
+2. Install required dependencies (no paramiko!)
 3. Start web server with WebSocket support
 4. Automatically open browser (http://127.0.0.1:5000)
 
-### Method 2: v1 Classic Launch
-
-Double-click **`start_server.bat`** for the classic v1 experience.
-
-### Method 3: Standalone EXE (No Python Required)
+### Method 2: Standalone EXE (No Python Required)
 
 | Version | File | Size |
 |---------|------|------|
-| v1 | `build\dist\WiFi_Sniffer_Control_Panel.exe` | 24.7 MB |
-| **v2** | `build\dist\WiFi_Sniffer_Control_Panel_v2.exe` | **38.6 MB** |
-| v3 | `build\dist\WiFi_Sniffer_Control_Panel_v3.exe` | 38.6 MB |
+| **v4** | `build\dist\WiFi_Sniffer_Control_Panel_v4.exe` | **~35 MB** |
+| v2 | `build\dist\WiFi_Sniffer_Control_Panel_v2.exe` | 38.6 MB |
 
-Build the EXE: run `build\build_v2.bat` from the project directory. Double-click the EXE - no Python installation needed!
+Build the EXE: run `build\build_v4.bat` from the project directory. Double-click the EXE - no Python installation needed!
+
+### Method 3: Older Versions
+
+Double-click `start_server_v3.bat`, `start_server_v2.bat`, or `start_server.bat` for older versions.
 
 ### Method 4: Manual Launch
 
@@ -133,11 +145,10 @@ Build the EXE: run `build\build_v2.bat` from the project directory. Double-click
 cd "path\to\Sniffer and Pcap Capture"
 
 # 2. Install dependencies (first time only)
-pip install -r requirements.txt
+pip install -r requirements_v4.txt
 
-# 3. Start server (choose one)
-python wifi_sniffer_web_control_v2.py   # v2 (recommended)
-python wifi_sniffer_web_control.py      # v1 (classic)
+# 3. Start server
+python wifi_sniffer_web_control_v4.py
 
 # 4. Open browser
 # http://127.0.0.1:5000
@@ -151,7 +162,7 @@ python wifi_sniffer_web_control.py      # v1 (classic)
 
 ### 修改方式
 
-**方法一：編輯 `start_server_v2.bat`**
+**方法一：編輯 `start_server_v4.bat`**
 ```batch
 :: 找到這行，修改 Port 號碼
 set FLASK_PORT=5000
@@ -160,7 +171,7 @@ set FLASK_PORT=5000
 **方法二：手動執行時設定環境變數**
 ```powershell
 $env:FLASK_PORT=5002
-python wifi_sniffer_web_control_v2.py
+python wifi_sniffer_web_control_v4.py
 ```
 
 ### 專案 Port 對照表
@@ -178,36 +189,43 @@ python wifi_sniffer_web_control_v2.py
 
 ```
 Sniffer and Pcap Capture/
-├── wifi_sniffer/                      # v2 Modular Package
-│   ├── __init__.py                    # Flask app factory
-│   ├── config.py                      # Centralized configuration
-│   ├── cache.py                       # Caching layer
+├── wifi_sniffer_v4/                   # v4 Package (Latest)
+│   ├── __init__.py                    # Flask app factory + service DI
+│   ├── config.py                      # Config + persistent JSON helpers
+│   ├── cache.py                       # TTL cache (monotonic clock)
+│   ├── logging_config.py              # Centralized logging setup
+│   ├── utils.py                       # Subprocess helpers
 │   ├── ssh/
-│   │   ├── connection.py              # SSH connection pool
-│   │   └── commands.py                # SSH command helpers
-│   ├── capture/
-│   │   └── manager.py                 # Capture state management
+│   │   ├── __init__.py                # Convenience wrappers
+│   │   └── client.py                  # Semaphore SSH client (no paramiko)
+│   ├── services/
+│   │   ├── __init__.py                # Service exports
+│   │   ├── capture.py                 # Capture start/stop/monitor
+│   │   ├── interfaces.py              # Auto-detect interface mapping
+│   │   ├── time_sync.py               # PC→OpenWrt time sync
+│   │   ├── wifi_config.py             # Channel/bandwidth config
+│   │   └── file_download.py           # Pcap download + split handling
 │   ├── routes/
-│   │   ├── api.py                     # REST API endpoints
-│   │   └── views.py                   # Page routes
+│   │   ├── __init__.py                # Blueprint setup
+│   │   ├── api.py                     # REST API (validated)
+│   │   └── views.py                   # Page rendering
 │   └── static/
-│       ├── css/style.css              # Extracted CSS (cacheable)
-│       └── js/app.js                  # Extracted JS (WebSocket)
+│       ├── css/style.css              # Dark theme CSS
+│       └── js/app.js                  # WebSocket + XSS-safe frontend
 ├── templates/
-│   └── index.html                     # HTML template
-├── wifi_sniffer_web_control_v2.py     # v2 entry point
-├── wifi_sniffer_web_control.py        # v1 classic (single file)
-├── requirements.txt                   # Python dependencies
+│   ├── index_v4.html                  # v4 HTML template
+│   └── index.html                     # v2/v3 HTML template
+├── wifi_sniffer_web_control_v4.py     # v4 entry point
+├── requirements_v4.txt                # v4 dependencies (no paramiko)
 ├── install.bat                        # One-click installation
-├── start_server_v2.bat                # v2 launcher
-├── start_server.bat                   # v1 launcher
-├── setup_ssh.bat                      # SSH connection setup
+├── start_server_v4.bat                # v4 launcher
 ├── build/
 │   ├── dist/
-│   │   ├── WiFi_Sniffer_Control_Panel_v2.exe
-│   │   └── WiFi_Sniffer_Control_Panel.exe
-│   ├── build_v2.bat                   # Build v2 EXE
-│   └── build.bat                      # Build v1 EXE
+│   │   └── WiFi_Sniffer_Control_Panel_v4.exe
+│   ├── build_v4.bat                   # Build v4 EXE
+│   └── wifi_sniffer_v4.spec           # PyInstaller spec
+├── wifi_sniffer_v3/                   # v3 Package (legacy)
+├── wifi_sniffer/                      # v2 Package (legacy)
 └── README.md                          # This documentation
 ```
 
@@ -219,7 +237,7 @@ Sniffer and Pcap Capture/
 
 #### 1. Start the Server
 ```
-Double-click: start_server_v2.bat
+Double-click: start_server_v4.bat
 ```
 - Wait for terminal to show "Running on http://127.0.0.1:5000"
 - Browser will open automatically
@@ -237,7 +255,7 @@ Double-click: start_server_v2.bat
 
 - Status badge changes from `IDLE` to `CAPTURING`
 - Duration timer starts counting
-- Packet count updates in real-time (WebSocket in v2)
+- File size updates in real-time (WebSocket in v4)
 
 #### 4. Stop and Download
 
@@ -364,14 +382,14 @@ Open the downloaded .pcap files with Wireshark for analysis
 4. **File Download** uses SSH pipe (`ssh cat /tmp/file > local_file`) since OpenWrt lacks sftp-server
 5. **Auto-cleanup** removes remote pcap files after successful download
 
-### v2 Architecture (Performance)
+### v4 Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                     Frontend (Browser)                       │
 │  ┌──────────┐  ┌──────────┐  ┌──────────────────────────┐  │
 │  │Static CSS│  │Static JS │  │  WebSocket Client        │  │
-│  │(Cached)  │  │(Cached)  │  │  (Real-time updates)     │  │
+│  │(Cached)  │  │(XSS-safe)│  │  (Real-time file sizes)  │  │
 │  └──────────┘  └──────────┘  └──────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
                               │
@@ -380,18 +398,29 @@ Open the downloaded .pcap files with Wireshark for analysis
 │                     Backend (Flask)                          │
 │  ┌──────────┐  ┌──────────┐  ┌──────────────────────────┐  │
 │  │Blueprints│  │Cache     │  │  WebSocket Server        │  │
-│  │(Routes)  │  │Layer     │  │  (Flask-SocketIO)        │  │
+│  │(Validated)│ │Layer     │  │  (Flask-SocketIO)        │  │
 │  └──────────┘  └──────────┘  └──────────────────────────┘  │
+│                                                             │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  5 Services: Capture | Interface | TimeSync |        │  │
+│  │               WifiConfig | FileDownload              │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                             │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  Persistent Config (~/.wifi_sniffer/config.json)      │  │
+│  │  Thread-safe with atomic writes                       │  │
+│  └──────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                    SSH Layer                                 │
+│                    SSH Layer (v4)                            │
 │  ┌──────────────────────────────────────────────────────┐  │
-│  │  Connection Pool (Singleton)                          │  │
-│  │  - Cached SSH executable path                         │  │
-│  │  - Thread-safe command execution                      │  │
-│  │  - Reusable connections                               │  │
+│  │  SSHClient Singleton (native OpenSSH only)            │  │
+│  │  - Semaphore(4): up to 4 concurrent SSH commands      │  │
+│  │  - SSH availability pre-check on startup              │  │
+│  │  - Interface name sanitization (shell injection safe)  │  │
+│  │  - Auto-detect ssh.exe path (Windows fallback)        │  │
 │  └──────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
                               │
@@ -531,12 +560,15 @@ ssh-keygen -R 192.168.1.1
 - Manually click 🔄 Sync in header anytime
 - Consider setting up NTP on OpenWrt for persistent time
 
-### Q: v2 WebSocket not working?
+### Q: v4 WebSocket not working?
 **A:** Check if Flask-SocketIO is installed:
 ```powershell
 pip install flask-socketio eventlet
 ```
 If WebSocket fails, the app automatically falls back to polling mode.
+
+### Q: v4 persistent config location?
+**A:** Config is stored at `%USERPROFILE%\.wifi_sniffer\config.json`. Delete this file to reset all settings to defaults.
 
 ---
 
@@ -576,6 +608,37 @@ If you encounter issues, please collect:
 ---
 
 ## 🔄 Changelog
+
+### v4.0 (2026-04-05)
+- **NEW**: Complete v4 rewrite with focus on quality, security, and robustness
+- **REMOVED**: paramiko dependency — uses only native Windows OpenSSH (fewer install issues)
+- **NEW**: Semaphore-based SSH concurrency (4 parallel) — replaces mutex serialization
+- **NEW**: Real file-size monitoring — shows actual pcap file size (KB/MB/GB) instead of fake packet count
+- **NEW**: Persistent configuration — channel, bandwidth, and file-split settings saved to `~/.wifi_sniffer/config.json` and restored on restart
+- **NEW**: Thread-safe config persistence with atomic writes (write-to-tmp then rename)
+- **NEW**: Input validation on ALL API endpoints — band, channel, bandwidth, type checks return HTTP 400
+- **NEW**: Shell injection prevention — interface names validated with regex before SSH commands
+- **NEW**: XSS protection — `escapeHtml()` applied to all API data inserted via innerHTML
+- **NEW**: Downloads directory auto-creation — no crash if ~/Downloads doesn't exist
+- **NEW**: `/api/version` endpoint for programmatic version checking
+- **IMPROVED**: `stop_all` only downloads bands that were actually running (smarter logic)
+- **IMPROVED**: Monitor thread now broadcasts via WebSocket — clients see real-time file size during capture
+- **IMPROVED**: `execute_background` now respects SSH semaphore with `release_background()` API
+- **IMPROVED**: `download_via_cat` correctly handles bytes stderr (was checking `isinstance(str)` on bytes)
+- **IMPROVED**: Default server binding changed to 127.0.0.1 (was 0.0.0.0 — security fix)
+- **IMPROVED**: SECRET_KEY generated randomly per-process (never hardcoded)
+- **IMPROVED**: Cache uses `time.monotonic()` instead of `time.time()` (immune to clock changes)
+- **IMPROVED**: Duration display shows HH:MM:SS for long captures
+- **IMPROVED**: File size formatting adds KB tier (was jumping from bytes to MB)
+- **IMPROVED**: SocketIO fallback no longer creates broken uninitialized object
+- **UPDATED**: `install.bat` now checks SSH availability and installs v4 deps (no paramiko)
+- **UPDATED**: `README.md` fully updated for v4 architecture and deployment
+
+### v3.0 (2026-03-15)
+- **NEW**: Service-oriented architecture (5 focused services)
+- **NEW**: Python logging with configurable levels
+- **IMPROVED**: Thread-safe SSH client
+- **IMPROVED**: Input validation on API endpoints
 
 ### v2.2 (2026-01-28)
 - **Optimized**: Channel apply flow now uses iwconfig (2G/5G) and cfg80211tool (6G) directly — no `wifi load` required
